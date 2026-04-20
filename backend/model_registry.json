@@ -4557,7 +4557,7 @@
           "recommended_instance": "ml.g6e.4xlarge",
           "build_instance": "ml.g5.12xlarge",
           "disk_gb": 80,
-          "_note": "32B model. Transformer quantized to NF4 (~10 GB on GPU). Text encoder (Mistral 3) kept in full bf16 (~22 GB) for best quality. Peak ~37 GB VRAM \u2014 fits on 48 GB L40S with device_map=balanced. Build phase (first deploy, no cache): needs 128GB+ RAM (g5.12xlarge). Serve phase (from cache): needs 96GB+ RAM (g6e.4xlarge)."
+          "_note": "32B model. Dual NF4: transformer (~10 GB) + text encoder (~5 GB) on GPU. Total ~20 GB \u2014 fits on 44.5 GB L40S with 24 GB headroom. No offloading needed when loaded from cache (components go to GPU directly). device_map=cpu only used during fresh build (quantization needs RAM)."
         },
         "invoke": {
           "library": "diffusers",
@@ -4580,7 +4580,7 @@
             },
             "num_inference_steps": {
               "type": "int",
-              "default": 28
+              "default": 40
             },
             "guidance_scale": {
               "type": "float",
@@ -4605,6 +4605,14 @@
               "subfolder": "transformer",
               "quantization": "nf4",
               "device_map": "cpu"
+            },
+            {
+              "name": "text_encoder",
+              "class": "Mistral3ForConditionalGeneration",
+              "module": "transformers",
+              "subfolder": "text_encoder",
+              "quantization": "nf4",
+              "device_map": "cpu"
             }
           ]
         },
@@ -4614,7 +4622,7 @@
             "ml.g5.12xlarge": 7.09
           }
         },
-        "version": "1.1",
+        "version": "1.3",
         "last_updated": "2025-06-01",
         "python_requirements": {
           "base": [

@@ -51,7 +51,54 @@ _config = {}
 # ── S3 Model Cache ───────────────────────────────────────────────────────
 _CACHE_LOCAL_DIR = "/tmp/model-cache"
 _CACHE_INFO_FILE = ".cache-info.json"
-_loaded_from_cache = False  # Set True when loading from S3 cache
+_loaded_from_cache = False       # Set True when loading from S3 cache
+_all_preserved_from_cache = False # Set True ONLY when all NF4 components preserved in cache
+_cache_info = {}                 # Loaded from .cache-info.json during cache download
+
+
+def _is_component_preserved(comp_name: str) -> bool:
+    """Check if a cached component has NF4 weights preserved (with BnB metadata).
+
+    Reads from .cache-info.json's quantized_components array. If the component
+    has "preserved": true, its weights are in BnB NF4 format and can be loaded
+    directly with quantization_config. If false, weights are bf16 and need
+    re-quantization on the fly.
+    """
+    for comp in _cache_info.get("quantized_components", []):
+        if comp.get("name") == comp_name:
+            return comp.get("preserved", False)
+    return False
+
+
+def _clean_stale_quant_artifacts(comp_path: str):
+    """Remove ALL stale BnB quantization artifacts from a cached component directory.
+
+    When save_pretrained() saves bf16 weights but leaves partial quantization
+    metadata (in separate files AND inside config.json), BnB gets confused on
+    reload — it finds conflicting signals about the weight format.
+    Cleaning these artifacts lets BnB treat it as a fresh bf16→NF4 quantization.
+    """
+    # 1. Remove standalone quantization config files
+    stale_files = ["quantization_config.json", "quantize_config.json"]
+    for fname in stale_files:
+        fpath = os.path.join(comp_path, fname)
+        if os.path.exists(fpath):
+            os.remove(fpath)
+            logger.info("Removed stale quantization file: %s", fpath)
+
+    # 2. Remove quantization_config from inside config.json (embedded metadata)
+    config_path = os.path.join(comp_path, "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            if "quantization_config" in config:
+                del config["quantization_config"]
+                with open(config_path, "w") as f:
+                    json.dump(config, f, indent=2)
+                logger.info("Removed embedded quantization_config from %s/config.json", comp_path.split("/")[-1])
+        except Exception as e:
+            logger.warning("Failed to clean config.json in %s: %s", comp_path, e)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -117,7 +164,7 @@ def _check_s3_cache():
 
     Returns local path to cached model, or None.
     """
-    global _loaded_from_cache
+    global _loaded_from_cache, _cache_info, _all_preserved_from_cache
     bucket, prefix = _get_cache_s3_path()
     if not bucket:
         return None
@@ -170,7 +217,36 @@ def _check_s3_cache():
         elapsed = _time.time() - t0
         logger.info("Downloaded %d files (%.1f GB) from S3 cache in %.1fs",
                      file_count, total_bytes / (1024**3), elapsed)
+
+        # Validate cache has actual model weights (not just config/scheduler/tokenizer).
+        # Sequential CPU offload models can't save weights (meta tensors) — their cache
+        # contains only metadata files. Reject such caches early so we fall through to HF.
+        has_weights = False
+        for root, dirs, files in os.walk(_CACHE_LOCAL_DIR):
+            for f in files:
+                if f.endswith((".safetensors", ".bin", ".pth", ".pt")):
+                    has_weights = True
+                    break
+            if has_weights:
+                break
+        if not has_weights:
+            logger.warning("S3 cache has no model weights (only config/metadata) — ignoring cache, will download from source")
+            import shutil as _shutil
+            _shutil.rmtree(_CACHE_LOCAL_DIR, ignore_errors=True)
+            return None
+
         _loaded_from_cache = True
+        _cache_info = cache_info  # Preserve for _is_component_preserved() lookups
+
+        # Check if ALL quantized components have preserved NF4
+        quant_comps = cache_info.get("quantized_components", [])
+        if quant_comps and all(c.get("preserved", False) for c in quant_comps):
+            _all_preserved_from_cache = True
+            logger.info("All quantized components have preserved NF4 — fast GPU load path available")
+        else:
+            not_preserved = [c["name"] for c in quant_comps if not c.get("preserved", False)]
+            logger.info("Components without preserved NF4 (will re-quantize from bf16): %s", not_preserved)
+
         return _CACHE_LOCAL_DIR
 
     except Exception as e:
@@ -536,8 +612,18 @@ def _load_diffusers(model_dir):
                         break
 
                 if comp_path:
-                    logger.info("Loading %s from cache: %s (re-quantizing to %s)", comp_name, comp_path, comp_quant)
-                    pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
+                    preserved = _is_component_preserved(comp_name)
+                    if preserved:
+                        # NF4 weights with BnB metadata preserved — load directly (fast)
+                        logger.info("Loading %s from cache: NF4 preserved, direct load", comp_name)
+                        pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
+                    else:
+                        # bf16 weights — clean stale BnB artifacts and re-quantize on the fly.
+                        # BnB will treat these as fresh bf16 weights and quantize to NF4,
+                        # same as a fresh HF download but from local disk (faster).
+                        _clean_stale_quant_artifacts(comp_path)
+                        logger.info("Loading %s from cache: bf16 → re-quantizing to %s (NF4 not preserved)", comp_name, comp_quant)
+                        pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
                 else:
                     logger.warning("Cache missing component %s — will load from pipeline (UNQUANTIZED)", comp_name)
                     continue
@@ -603,13 +689,22 @@ def _load_diffusers(model_dir):
 
     try:
         pipe = PipelineClass.from_pretrained(model_source, **kwargs)
-    except Exception:
+    except Exception as load_err:
+        # If loading from cache failed, fall back to HuggingFace repo (not same broken path).
+        # This handles corrupt/incomplete caches gracefully.
+        hf_repo = _get_env("ARTSMOKER_HF_REPO")
+        fallback_source = hf_repo if (hf_repo and _loaded_from_cache) else model_source
+        if fallback_source != model_source:
+            logger.warning("Cache load failed (%s) — falling back to HuggingFace: %s", load_err, fallback_source)
+        else:
+            logger.warning("Pipeline load failed (%s) — retrying with minimal kwargs", load_err)
+
         fallback_kwargs = {"torch_dtype": _get_torch_dtype()}
         if hf_token:
             fallback_kwargs["token"] = hf_token
         if pre_loaded:
             fallback_kwargs.update(pre_loaded)
-        pipe = PipelineClass.from_pretrained(model_source, **fallback_kwargs)
+        pipe = PipelineClass.from_pretrained(fallback_source, **fallback_kwargs)
 
     # GPU placement strategy for quantized models:
     # device_map="balanced" causes CUDA illegal memory access when text encoder is on CPU
@@ -619,11 +714,23 @@ def _load_diffusers(model_dir):
     # With bf16 text encoder (~22 GB) + NF4 transformer (~10 GB), each fits on 44.5 GB L40S.
     # Speed: text encoding once (~15s) + 28 denoising steps (~3-4 min) = ~3.5 min total.
     has_quantized = bool(pre_loaded)
+    all_quantized = has_quantized and len(pre_loaded) == len([
+        c for c in _config.get("quantization_components", []) if isinstance(c, dict)
+    ])
 
     if device_map:
         logger.info("Skipping .to(cuda)/offload — model placed by device_map")
+    elif all_quantized and _all_preserved_from_cache:
+        # All components have PRESERVED NF4 weights loaded from cache — already compact,
+        # loaded directly to GPU (no device_map="cpu" needed for preserved NF4).
+        # Total ~16 GB NF4 fits easily on 44.5+ GB L40S GPU.
+        # This is the fast path: ~30-60s/image instead of ~5 min with model_cpu_offload.
+        logger.info("All components NF4 preserved from cache — moving pipeline to GPU (fast inference)")
+        pipe.to("cuda")
     elif has_quantized:
-        logger.info("Quantized components present — using model_cpu_offload (one component on GPU at a time)")
+        # Quantized components loaded to CPU (fresh build OR cache re-quantization).
+        # Use model_cpu_offload to move one at a time — slower but safe.
+        logger.info("Quantized components on CPU — using model_cpu_offload")
         pipe.enable_model_cpu_offload()
     elif _get_env_bool("ENABLE_MODEL_CPU_OFFLOAD"):
         logger.info("Enabling model CPU offload (keeps only active component on GPU)")
@@ -907,14 +1014,24 @@ def model_fn(model_dir):
     except Exception as e:
         logger.warning("Version logging failed: %s", e)
 
-    # Load invoke config if provided as JSON
-    config_json = _get_env("INVOKE_CONFIG")
-    if config_json:
+    # Load invoke config — prefer file (no truncation risk), fall back to env var
+    config_file = os.path.join(model_dir, "code", "invoke_config.json")
+    if os.path.exists(config_file):
         try:
-            _config = json.loads(config_json)
-            logger.info("INVOKE_CONFIG loaded (%d keys)", len(_config))
-        except Exception:
+            with open(config_file) as f:
+                _config = json.load(f)
+            logger.info("invoke_config.json loaded from model.tar.gz (%d keys)", len(_config))
+        except Exception as e:
+            logger.warning("Failed to load invoke_config.json: %s", e)
             _config = {}
+    else:
+        config_json = _get_env("INVOKE_CONFIG")
+        if config_json:
+            try:
+                _config = json.loads(config_json)
+                logger.info("INVOKE_CONFIG loaded from env var (%d keys)", len(_config))
+            except Exception:
+                _config = {}
 
     loader = _LOADERS.get(library)
     if not loader:
@@ -934,14 +1051,18 @@ def model_fn(model_dir):
         logger.info("GPU memory after load: %.2f GB allocated, %.2f GB reserved", allocated, reserved)
 
     # S3 cache save strategy:
-    # - Normal mode: deferred until first successful inference (in predict_fn)
-    # - Build mode (ARTSMOKER_BUILD_ONLY=true): save SYNCHRONOUSLY after model_fn.
-    #   Must block until upload completes — if we return early, MMS marks the model
-    #   as "loaded" and auto-scaling could kill the instance before upload finishes.
+    # - Build mode (ARTSMOKER_BUILD_ONLY=true): save SYNCHRONOUSLY — must block
+    #   until upload completes, or auto-scaling could kill the instance mid-upload.
+    # - Normal mode: save in BACKGROUND thread — don't delay model readiness.
+    #   We save immediately after model_fn (not after first inference) because
+    #   the instance may scale down before any inference arrives.
     if _get_env("ARTSMOKER_CACHE_BUCKET") and not _loaded_from_cache:
         if _get_env_bool("ARTSMOKER_BUILD_ONLY"):
             logger.info("Build mode — saving cache synchronously after model load")
             _save_to_s3_cache_sync(_model)
+        else:
+            logger.info("Normal mode — saving cache in background after model load")
+            _save_to_s3_cache(_model)
 
     return _model
 
@@ -991,13 +1112,8 @@ def predict_fn(input_data, model_dict):
         logger.info("Inference complete in %.1fs (predictor=%s, output=%d chars)",
                      elapsed, predictor_type, len(result) if isinstance(result, str) else 0)
 
-        # After first successful inference, save model to S3 cache.
-        # We wait for a real inference to confirm the model actually works —
-        # don't cache weights that load but fail at generation time.
-        global _loaded_from_cache
-        if _get_env("ARTSMOKER_CACHE_BUCKET") and not _loaded_from_cache and not getattr(predict_fn, "_cache_saved", False):
-            predict_fn._cache_saved = True
-            _save_to_s3_cache(model_dict)
+        # Cache save now happens in model_fn() (background thread in normal mode,
+        # synchronous in build mode). No longer deferred to first inference.
 
         return result
     except Exception as exc:

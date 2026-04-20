@@ -32,6 +32,7 @@ from backend.services.prompt_engineer import (
     get_last_negative_prompt,
     refine_marketing_prompt,
     refine_prompt,
+    refine_prompt_structured,
 )
 from backend.services.prompt_templates import get_template
 from backend.storage.local_store import store
@@ -88,7 +89,7 @@ def _slugify_prompt(prompt: str, max_len: int = 40) -> str:
 def _generate_single_image(
     *,
     asset_id: str,
-    refined_prompt: str,
+    enhanced_prompt: str,
     body: GenerationRequest,
     seed: int,
     negative_prompt: str = "",
@@ -97,7 +98,7 @@ def _generate_single_image(
 ) -> tuple[bytes | dict, str | None]:
     effective_model = model_override or body.image_model
     result = generate_image(
-        refined_prompt=refined_prompt,
+        enhanced_prompt=enhanced_prompt,
         model=effective_model,
         width=body.width,
         height=body.height,
@@ -120,7 +121,7 @@ def _generate_single_image(
     )
     final_bytes, svg_path = process_asset(
         image_bytes=image_bytes,
-        refined_prompt=refined_prompt,
+        enhanced_prompt=enhanced_prompt,
         remove_bg=body.remove_background,
         do_upscale=body.upscale,
         do_svg=body.generate_svg,
@@ -136,7 +137,7 @@ def _build_variant(
     batch_id: str,
     option_index: int,
     variant_index: int,
-    refined_prompt: str,
+    enhanced_prompt: str,
     negative_prompt: str = "",
     body: GenerationRequest,
     seed: int,
@@ -173,7 +174,7 @@ def _build_variant(
 
     gen_result, svg_url = _generate_single_image(
         asset_id=asset_id,
-        refined_prompt=refined_prompt,
+        enhanced_prompt=enhanced_prompt,
         body=body,
         seed=seed,
         negative_prompt=negative_prompt,
@@ -196,7 +197,7 @@ def _build_variant(
             "original_prompt": body.original_prompt,
             "moderation_original": body.moderation_original,
             "prompt": body.prompt,
-            "refined_prompt": refined_prompt,
+            "enhanced_prompt": enhanced_prompt,
             "negative_prompt": negative_prompt,
             "style_id": body.style_id,
             "style_snapshot": style_snapshot,
@@ -232,7 +233,7 @@ def _build_variant(
             png_path="",
             svg_path=None,
             seed=seed,
-            prompt_used=refined_prompt,
+            prompt_used=enhanced_prompt,
             model_used=str(model_override or body.image_model),
             model_label=model_label or "",
             async_job=gen_result,
@@ -261,7 +262,7 @@ def _build_variant(
         "prompt": body.prompt,
         "original_language": translation_result["source_lang"] if translation_result else "en",
         "original_language_prompt": translation_result["original"] if translation_result and translation_result["was_translated"] else None,
-        "refined_prompt": refined_prompt,
+        "enhanced_prompt": enhanced_prompt,
         "negative_prompt": negative_prompt,
         "style_id": body.style_id,
         "style_snapshot": style_snapshot,
@@ -362,9 +363,14 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
     except Exception as exc:
         logger.warning("Prompt translation failed, using original: %s", exc)
 
+    # Track decomposed/recomposed prompt data for the frontend and metadata
+    decomposed_data = {}
+    recomposed_prompt = None  # The flat prompt from decompose→recompose (Step 2 output)
+
     # Generate concept prompts (skip if pre-composed by the user)
     if body.pre_composed and n_opts == 1:
         # User already composed the prompt via "Compose Generation Prompt" — use as-is
+        recomposed_prompt = body.prompt  # Pre-composed IS the recomposed prompt
         concept_prompts = [body.prompt]
         emit({"type": "stage", "stage": "prompts",
               "message": "Using your composed prompt..."})
@@ -377,17 +383,37 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
         model_id = body.image_model
         try:
             if body.pre_composed and n_opts > 1:
+                # User composed via Designer — their prompt IS the recomposed prompt
+                recomposed_prompt = body.prompt
                 concept_prompts = generate_concept_prompts(
                     body.prompt, style_profile, body.asset_type, n_opts, image_model=model_id,
+                    recomposed_prompt=recomposed_prompt,
                 )
             elif n_opts == 1:
                 if body.asset_type == AssetType.MARKETING_BANNER:
                     concept_prompts = [refine_marketing_prompt(body.prompt, style_profile, image_model=model_id)]
                 else:
-                    concept_prompts = [refine_prompt(body.prompt, style_profile, body.asset_type, image_model=model_id)]
+                    # Step 2: Decompose → Recompose (recomposed prompt)
+                    recomposed_prompt, decomposed_data = refine_prompt_structured(
+                        body.prompt, style_profile, body.asset_type, image_model=model_id,
+                    )
+                    # Step 3: Enhance with model-specific guidance → enhanced prompt
+                    concept_prompts = generate_concept_prompts(
+                        body.prompt, style_profile, body.asset_type, n_opts=1, image_model=model_id,
+                        recomposed_prompt=recomposed_prompt,
+                    )
             else:
+                # Multi-option: decompose→recompose first, then generate N
+                # enhanced concept prompts using the recomposed as quality guidance.
+                try:
+                    recomposed_prompt, decomposed_data = refine_prompt_structured(
+                        body.prompt, style_profile, body.asset_type, image_model=model_id,
+                    )
+                except Exception:
+                    pass  # Non-fatal — concept generation can still work without it
                 concept_prompts = generate_concept_prompts(
                     body.prompt, style_profile, body.asset_type, n_opts, image_model=model_id,
+                    recomposed_prompt=recomposed_prompt,
                 )
         except PromptRefusalError as refusal:
             logger.warning("Claude refused to refine prompt: %s", refusal.reason[:200])
@@ -420,8 +446,10 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
     # Emit the composed/refined prompts so the frontend can display them
     emit({"type": "prompts_ready",
           "prompts": concept_prompts,
+          "recomposed_prompt": recomposed_prompt or "",
           "negative_prompt": negative_prompt or "",
-          "pre_composed": body.pre_composed})
+          "pre_composed": body.pre_composed,
+          "decomposed": decomposed_data or {}})
 
     emit({"type": "stage", "stage": "generating",
           "message": f"Generating {total} images...", "prompts_done": len(concept_prompts)})
@@ -442,7 +470,7 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
             batch_id=batch_id,
             option_index=0,
             variant_index=0,
-            refined_prompt=concept_prompts[0],
+            enhanced_prompt=concept_prompts[0],
             negative_prompt=negative_prompt,
             body=body,
             seed=canary_seed,
@@ -512,7 +540,7 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
                     batch_id=batch_id,
                     option_index=oi,
                     variant_index=vi,
-                    refined_prompt=prompt,
+                    enhanced_prompt=prompt,
                     negative_prompt=negative_prompt,
                     body=body,
                     seed=seed,
@@ -622,7 +650,7 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
         if variants:  # Only include options that have at least one variant
             options.append(OptionResult(
                 option_index=oi,
-                refined_prompt=concept_prompts[oi],
+                enhanced_prompt=concept_prompts[oi],
                 negative_prompt=negative_prompt,
                 image_model=body.image_model,
                 variants=variants,
@@ -655,6 +683,23 @@ def _run_generation(body: GenerationRequest, progress_cb=None):
         total_cost_usd=actual_cost,
         cost_breakdown=cost_breakdown,
     )
+
+    # Persist recomposed + decomposed prompt data to all variant metadata files
+    # so they're available when loading from Gallery later.
+    if recomposed_prompt or decomposed_data:
+        for opt in options:
+            for v in opt.variants:
+                try:
+                    meta_path = store.generated_asset_dir(v.id) / "metadata.json"
+                    if meta_path.exists():
+                        meta = json.loads(meta_path.read_text())
+                        if recomposed_prompt:
+                            meta["recomposed_prompt"] = recomposed_prompt
+                        if decomposed_data:
+                            meta["decomposed_data"] = decomposed_data
+                        meta_path.write_text(json.dumps(meta, indent=2))
+                except Exception:
+                    pass  # Non-fatal
 
     # Send accurate cost to telemetry
     from backend.services.telemetry import track_image_cost
@@ -747,23 +792,34 @@ def _run_all_models_generation(body: GenerationRequest, progress_cb=None):
     concept_prompts: dict[str, list[str]] = {}
     negative_prompts: dict[str, list[str]] = {}
 
+    # Pre-decompose once for all models — the recomposed prompt guides concept generation
+    all_models_recomposed = None
+    all_models_decomposed = None
+    if not body.pre_composed:
+        try:
+            all_models_recomposed, all_models_decomposed = refine_prompt_structured(
+                body.prompt, style_profile, body.asset_type,
+            )
+        except Exception:
+            pass  # Non-fatal
+
     try:
         if body.model_optimized_prompts:
             # Model-optimized: tailored prompts per model
             for mk in model_keys:
                 if n_opts == 1:
-                    # Single option — use the faster refine_prompt
                     if body.asset_type == AssetType.MARKETING_BANNER:
                         p = refine_marketing_prompt(body.prompt, style_profile, image_model=mk)
                     else:
-                        p = refine_prompt(body.prompt, style_profile, body.asset_type, image_model=mk)
+                        p, _ = refine_prompt_structured(body.prompt, style_profile, body.asset_type, image_model=mk)
                     concept_prompts[mk] = [p]
                     negative_prompts[mk] = [get_last_negative_prompt()]
                 else:
                     # Multiple options — generate N distinct concepts per model
                     prompts = generate_concept_prompts(
                         body.prompt, style_profile, body.asset_type,
-                        num_options=n_opts, image_model=mk)
+                        num_options=n_opts, image_model=mk,
+                        recomposed_prompt=all_models_recomposed)
                     concept_prompts[mk] = prompts
                     negative_prompts[mk] = [get_last_negative_prompt()] * n_opts
                 logger.info("Model-optimized: %s got %d concept(s)", mk, len(concept_prompts[mk]))
@@ -776,12 +832,13 @@ def _run_all_models_generation(body: GenerationRequest, progress_cb=None):
                 if body.asset_type == AssetType.MARKETING_BANNER:
                     p = refine_marketing_prompt(body.prompt, style_profile)
                 else:
-                    p = refine_prompt(body.prompt, style_profile, body.asset_type)
+                    p, _ = refine_prompt_structured(body.prompt, style_profile, body.asset_type)
                 shared_prompts = [p]
                 shared_negatives = [get_last_negative_prompt() or body.negative_prompt or ""]
             else:
                 shared_prompts = generate_concept_prompts(
-                    body.prompt, style_profile, body.asset_type, num_options=n_opts)
+                    body.prompt, style_profile, body.asset_type, num_options=n_opts,
+                    recomposed_prompt=all_models_recomposed)
                 shared_negatives = [get_last_negative_prompt()] * n_opts
 
             # Pad if fewer prompts returned than requested
@@ -820,8 +877,10 @@ def _run_all_models_generation(body: GenerationRequest, progress_cb=None):
     # Emit prompts (first concept per model for preview)
     emit({"type": "prompts_ready",
           "prompts": [concept_prompts[mk][0] for mk in model_keys],
+          "recomposed_prompt": all_models_recomposed or "",
           "negative_prompt": negative_prompts.get(model_keys[0], [""])[0],
           "pre_composed": body.pre_composed,
+          "decomposed": all_models_decomposed or {},
           "all_models": True,
           "model_labels": {i: model_labels[mk] for i, mk in enumerate(model_keys)},
           "options_per_model": n_opts})
@@ -876,7 +935,7 @@ def _run_all_models_generation(body: GenerationRequest, progress_cb=None):
                 batch_id=batch_id,
                 option_index=flat_opt_idx,
                 variant_index=var_idx,
-                refined_prompt=prompt,
+                enhanced_prompt=prompt,
                 negative_prompt=negative,
                 body=body,
                 seed=seed,
@@ -965,7 +1024,7 @@ def _run_all_models_generation(body: GenerationRequest, progress_cb=None):
 
         options.append(OptionResult(
             option_index=fi,
-            refined_prompt=meta["prompt"],
+            enhanced_prompt=meta["prompt"],
             negative_prompt=meta["negative"],
             image_model=meta["model_key"],
             model_label=meta["label"],
@@ -1015,6 +1074,22 @@ def _run_all_models_generation(body: GenerationRequest, progress_cb=None):
         total_cost_usd=actual_cost,
         cost_breakdown=cost_breakdown,
     )
+
+    # Persist recomposed + decomposed to all variant metadata
+    if all_models_recomposed or all_models_decomposed:
+        for opt in options:
+            for v in opt.variants:
+                try:
+                    meta_path = store.generated_asset_dir(v.id) / "metadata.json"
+                    if meta_path.exists():
+                        meta = json.loads(meta_path.read_text())
+                        if all_models_recomposed:
+                            meta["recomposed_prompt"] = all_models_recomposed
+                        if all_models_decomposed:
+                            meta["decomposed_data"] = all_models_decomposed
+                        meta_path.write_text(json.dumps(meta, indent=2))
+                except Exception:
+                    pass
 
     from backend.services.telemetry import track_image_cost
     track_image_cost(cost_usd=actual_cost, model="all_models",
@@ -1330,7 +1405,7 @@ async def edit_image(body: ImageEditRequest):
             "version": 1,
             "type": "original",
             "prompt": source_meta.get("prompt", ""),
-            "refined_prompt": source_meta.get("refined_prompt", ""),
+            "enhanced_prompt": source_meta.get("enhanced_prompt", ""),
             "negative_prompt": source_meta.get("negative_prompt", ""),
             "image_model": source_meta.get("image_model", ""),
             "model_label": source_meta.get("model_label", ""),
@@ -1366,7 +1441,7 @@ async def edit_image(body: ImageEditRequest):
         svg_output_path = asset_dir / "asset.svg"
         _, svg_path = process_asset(
             image_bytes=result_bytes,
-            refined_prompt=body.prompt,
+            enhanced_prompt=body.prompt,
             remove_bg=False,
             do_upscale=False,
             do_svg=True,
@@ -1549,7 +1624,7 @@ async def analyze_moderation(body: ModerationRequest):
         logger.info("Moderation fallback: testing '%s' on %s...", body.prompt[:50], alt_model.value)
         try:
             generate_image(
-                refined_prompt=body.prompt,
+                enhanced_prompt=body.prompt,
                 model=alt_model,
                 width=body.width,
                 height=body.height,
@@ -1650,7 +1725,7 @@ async def analyze_moderation(body: ModerationRequest):
             for test_model in test_models:
                 try:
                     generate_image(
-                        refined_prompt=rewritten,
+                        enhanced_prompt=rewritten,
                         model=test_model,
                         width=body.width,
                         height=body.height,
@@ -1767,7 +1842,7 @@ async def post_process_assets(body: PostProcessRequest):
                     if idx > 0:
                         time.sleep(1)  # Throttle between upscale calls
                     try:
-                        prompt = meta.get("refined_prompt", meta.get("prompt", ""))
+                        prompt = meta.get("enhanced_prompt", meta.get("prompt", ""))
                         current_bytes = upscale_image(current_bytes, prompt)
                         changed = True
                         meta["upscaled"] = True

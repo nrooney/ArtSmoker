@@ -206,6 +206,18 @@ def upload_handler_to_s3(model_key: str, progress_callback=None) -> str:
         # Generate model-specific requirements.txt from catalog
         _generate_requirements(model_key, code_dir / "requirements.txt")
 
+        # Write FULL invoke config as JSON file — no env var truncation risk.
+        # The handler reads this first, falls back to INVOKE_CONFIG env var.
+        from .custom_models import get_catalog_model
+        catalog_model = get_catalog_model(model_key)
+        if catalog_model:
+            invoke_config = catalog_model.get("invoke", {})
+            # Strip only prompt_guidance (too large, not needed by handler)
+            invoke_for_file = {k: v for k, v in invoke_config.items() if k != "prompt_guidance"}
+            config_path = code_dir / "invoke_config.json"
+            config_path.write_text(json.dumps(invoke_for_file, indent=2, default=str))
+            logger.info("Wrote invoke_config.json (%d bytes) to model.tar.gz", config_path.stat().st_size)
+
         # Create model.tar.gz — Amazon SageMaker requires this format
         tar_path = temp_dir / "model.tar.gz"
         with tarfile.open(str(tar_path), "w:gz") as tar:
@@ -664,16 +676,31 @@ def _check_model_readiness(endpoint_name: str) -> dict:
     """
     import time as _time
 
-    # 1. Cached readiness (permanent once confirmed)
+    # 1. Cached readiness (permanent once confirmed in memory)
     cached = _model_readiness.get(endpoint_name)
     if cached and cached.get("ready"):
         return cached
+
+    # 1b. Check registry for persisted readiness (survives server restart)
+    try:
+        from backend.services.model_registry import get_registry
+        reg = get_registry()
+        for key, cfg in reg.get("image_models", {}).items():
+            dep = cfg.get("deployment", {})
+            if dep.get("endpoint_name") == endpoint_name and dep.get("model_ready"):
+                result = {"ready": True, "detail": "Confirmed ready (from registry)"}
+                _model_readiness[endpoint_name] = result
+                return result
+    except Exception:
+        pass
 
     # 2. Quick log scan (non-blocking, fast)
     readiness = _scan_logs_for_readiness(endpoint_name)
     if readiness["ready"]:
         _model_readiness[endpoint_name] = readiness
         logger.info("Model ready confirmed for %s: %s", endpoint_name, readiness["detail"])
+        # Persist to registry so readiness survives server restart
+        _persist_readiness_to_registry(endpoint_name)
         # Ensure auto-scaling is registered (may be first confirmation)
         _register_auto_scaling_after_ready(endpoint_name)
         return readiness
@@ -715,9 +742,34 @@ def _scan_logs_for_readiness(endpoint_name: str) -> dict:
         if not stream_name:
             return {"ready": False, "detail": "Waiting for container to start..."}
 
-        # Read from the END of the stream (most recent events) and filter
-        # pings in Python. get_log_events with startFromHead=False gives us
-        # the tail, which is where checkpoint progress lives.
+        # Two-pass log scan:
+        # 1. filter_log_events with "loaded in" pattern — fast server-side scan
+        #    across the entire log history. Catches model load even after hours of pings.
+        # 2. get_log_events tail for progress/error detection (checkpoint shards, etc.)
+        #
+        # The old approach (get_log_events limit=500) failed because 500 events
+        # covers only ~40 min of pings, but model load can take 60+ min.
+
+        # Pass 1: Check if model already loaded (fast — scans entire history server-side)
+        try:
+            loaded_events = logs_client.filter_log_events(
+                logGroupName=log_group,
+                logStreamNames=[stream_name],
+                filterPattern='"loaded in"',
+                limit=5,
+            )
+            for e in reversed(loaded_events.get("events", [])):
+                msg = e["message"].strip()
+                if "loaded in" in msg and "Model" in msg:
+                    try:
+                        detail = msg[msg.index("Model"):msg.index("Model") + 80]
+                    except (ValueError, IndexError):
+                        detail = "Model loaded"
+                    return {"ready": True, "detail": detail, "last_activity_ms": e.get("timestamp", 0)}
+        except Exception:
+            pass  # Fall through to tail scan
+
+        # Pass 2: Tail scan for progress and errors (recent events only)
         raw_events = logs_client.get_log_events(
             logGroupName=log_group,
             logStreamName=stream_name,
@@ -805,6 +857,31 @@ def _scan_logs_for_readiness(endpoint_name: str) -> dict:
         return {"ready": False, "detail": "Checking..."}
 
 
+def _persist_readiness_to_registry(endpoint_name: str):
+    """Persist model readiness to the registry so it survives server restarts.
+
+    Writes deployment.model_ready=True to the model's user registry entry.
+    On next server start, _check_model_readiness reads this and skips log scanning.
+    Cleared on teardown (deployment entry removed) or redeploy.
+    """
+    try:
+        from backend.services.model_registry import get_registry, _save_user_overrides
+        import json, pathlib
+        user_path = pathlib.Path("backend/model_registry.user.json")
+        if not user_path.exists():
+            return
+        user = json.loads(user_path.read_text())
+        for key, cfg in user.get("image_models", {}).items():
+            dep = cfg.get("deployment", {})
+            if dep.get("endpoint_name") == endpoint_name:
+                dep["model_ready"] = True
+                user_path.write_text(json.dumps(user, indent=2))
+                logger.info("Persisted model_ready=True for %s in registry", endpoint_name)
+                return
+    except Exception as e:
+        logger.debug("Failed to persist readiness to registry: %s", e)
+
+
 def _start_readiness_monitor(endpoint_name: str):
     """Start a background thread that polls logs until the model is ready."""
     import threading, time as _time
@@ -820,6 +897,7 @@ def _start_readiness_monitor(endpoint_name: str):
                 if readiness.get("ready"):
                     _model_readiness[endpoint_name] = readiness
                     logger.info("Background monitor: %s is ready — %s", endpoint_name, readiness["detail"])
+                    _persist_readiness_to_registry(endpoint_name)
                     # Now safe to register auto-scaling (model is loaded, won't be killed)
                     _register_auto_scaling_after_ready(endpoint_name)
                     break
@@ -842,10 +920,29 @@ def _start_readiness_monitor(endpoint_name: str):
 
 
 def clear_readiness_cache(endpoint_name: str):
-    """Clear readiness cache for an endpoint (called on teardown/redeploy)."""
+    """Clear readiness cache for an endpoint (called on teardown/redeploy).
+
+    Clears both in-memory cache and registry-persisted model_ready flag.
+    """
     _model_readiness.pop(endpoint_name, None)
     _readiness_monitors.discard(endpoint_name)
     _auto_scaling_registered.discard(endpoint_name)
+
+    # Clear persisted readiness from registry
+    try:
+        import json, pathlib
+        user_path = pathlib.Path("backend/model_registry.user.json")
+        if user_path.exists():
+            user = json.loads(user_path.read_text())
+            for key, cfg in user.get("image_models", {}).items():
+                dep = cfg.get("deployment", {})
+                if dep.get("endpoint_name") == endpoint_name and dep.get("model_ready"):
+                    dep.pop("model_ready", None)
+                    user_path.write_text(json.dumps(user, indent=2))
+                    logger.debug("Cleared model_ready for %s in registry", endpoint_name)
+                    break
+    except Exception:
+        pass
 
 
 def check_endpoint_status(endpoint_name: str) -> dict:
@@ -1548,9 +1645,17 @@ def _get_model_environment(model_key: str, model: dict,
         "ARTSMOKER_HF_REPO": source.get("repo_id", ""),
         "SAGEMAKER_PROGRAM": "inference.py",
         "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code",
-        # Full invoke config as JSON — strip server-side-only fields to stay under 1024-char limit
+        # Invoke config as JSON for the container handler. SageMaker silently truncates
+        # env vars — strip fields the handler doesn't need to stay well under the limit.
+        # Handler needs: library, loader_class, torch_dtype, quantization_components,
+        # predictor_type, output_type, enable_vae_slicing, max_concurrent_invocations.
+        # Handler does NOT need: prompt_guidance, input_fields, supports_negative_prompt,
+        # max_prompt_length, typical_latency_seconds (all server-side only).
         "INVOKE_CONFIG": json.dumps(
-            {k: v for k, v in invoke.items() if k not in ("prompt_guidance",)},
+            {k: v for k, v in invoke.items() if k not in (
+                "prompt_guidance", "input_fields", "supports_negative_prompt",
+                "max_prompt_length", "typical_latency_seconds",
+            )},
             default=str,
         ),
         # CUDA memory management

@@ -91,6 +91,15 @@
             this._showComposed(text);
         }
 
+        setDecomposedText(text) {
+            const panel = this.container.querySelector('.decomposed-panel');
+            const textarea = this.container.querySelector('.decomposed-textarea');
+            if (panel && textarea) {
+                textarea.value = text;
+                panel.classList.remove('hidden');
+            }
+        }
+
         onChanged(cb) {
             this._changeCb = cb;
         }
@@ -158,6 +167,14 @@
                             <span>🎨</span> ${typeof t !== 'undefined' ? t('prompt_editor.prompt_designer') : 'Prompt Designer'}
                         </button>
                         <p class="compose-note text-[10px] text-brand-text-muted/60 mt-1">${typeof t !== 'undefined' ? t('prompt_editor.step2_tip') : 'Breaks down your prompt into editable visual components — subject, scene, lighting, colors. Skip this and go straight to Generate if you prefer.'}</p>
+                        <div class="decomposed-panel hidden mt-2">
+                            <textarea
+                                class="decomposed-textarea input w-full min-h-[120px] text-xs text-brand-text/70 bg-amber-950/10 border-amber-500/20"
+                                rows="8" readonly
+                                placeholder="Recomposed prompt will appear here after generation..."
+                            ></textarea>
+                            <p class="text-[10px] text-brand-text-muted/40 mt-0.5">Recomposed from your prompt. Click Prompt Designer above to edit components.</p>
+                        </div>
                     </div>
 
                     <!-- Step 3: Enhanced Prompt Preview -->
@@ -328,9 +345,20 @@
         }
 
         async _composeFromDesigner(designerData) {
-            // Auto-recompose the designer's structured data into an enhanced prompt
+            // Step 2 complete: recompose from designer data, then auto-trigger Step 3
+            // 1. Recompose the structured data into a flat recomposed prompt
+            // 2. Feed that into Step 3's enhance flow (same as clicking the button)
+            if (this._isComposing) return;
+            this._isComposing = true;
+
+            // Show loading on Step 3 button while both steps run
+            const origHTML = this._btnCompose.innerHTML;
+            this._btnCompose.innerHTML = `<span class="spinner-sm"></span> ${typeof t !== 'undefined' ? t('prompt_editor.composing') : 'Composing...'}`;
+            this._btnCompose.disabled = true;
+
             try {
-                const resp = await fetch('/api/refine-prompt/recompose', {
+                // Step 2 → Recompose
+                const recomposeResp = await fetch('/api/refine-prompt/recompose', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -338,15 +366,32 @@
                         image_model: this.opts.imageModel || 'nova_canvas',
                     }),
                 });
-                if (resp.ok) {
-                    const result = await resp.json();
-                    this._composedText = result.prompt;
-                    this._negativePrompt = result.negative_prompt || '';
-                    this._userComposed = true;
-                    this._showComposed(result.prompt);
-                }
+                if (!recomposeResp.ok) throw new Error('Recompose failed');
+                const recomposeResult = await recomposeResp.json();
+                const recomposedPrompt = recomposeResult.prompt;
+
+                // Step 3 → Enhance for model (using recomposed as input)
+                const enhancePayload = {
+                    prompt: recomposedPrompt,
+                    style_id: this.opts.styleId || undefined,
+                    asset_type: this.opts.assetType || undefined,
+                    image_model: this.opts.imageModel || undefined,
+                };
+                const enhanceResult = await API.refinePrompt(enhancePayload);
+                const enhanced = enhanceResult.refined || enhanceResult.enhanced_prompt || enhanceResult;
+
+                this._originalText = this._textareaEl.value;
+                this._composedText = enhanced;
+                this._negativePrompt = enhanceResult.negative_prompt || recomposeResult.negative_prompt || '';
+                this._userComposed = true;
+                this._showComposed(enhanced);
             } catch (err) {
                 console.error('Failed to compose from designer data:', err);
+                window.showToast?.('Failed to generate enhanced prompt', 'error');
+            } finally {
+                this._btnCompose.innerHTML = origHTML;
+                this._btnCompose.disabled = false;
+                this._isComposing = false;
             }
         }
 
@@ -429,7 +474,7 @@
                     } catch {}
                 }
 
-                const composed = result.refined || result.refined_prompt || result;
+                const composed = result.refined || result.enhanced_prompt || result;
 
                 this._originalText = text;
                 this._composedText = composed;
