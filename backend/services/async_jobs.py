@@ -657,6 +657,27 @@ def _check_job(job: dict, s3):
     parts = output_location.replace("s3://", "").split("/", 1)
     bucket, key = parts[0], parts[1]
 
+    # Check for failure file first — SageMaker writes errors to {output}.failure
+    try:
+        failure_key = key + ".failure"
+        failure_obj = s3.get_object(Bucket=bucket, Key=failure_key)
+        failure_body = failure_obj["Body"].read().decode("utf-8", errors="replace")
+        with _lock:
+            job["status"] = FAILED
+            job["error"] = failure_body[:500] if failure_body else "Model returned an error (no details)"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _update_gallery_on_failure(job)
+        _cleanup_s3(job, s3)
+        # Also delete the failure file
+        try:
+            s3.delete_object(Bucket=bucket, Key=failure_key)
+        except Exception:
+            pass
+        logger.warning("Async job %s failed (error output in S3): %s", job["job_id"], job["error"][:200])
+        return
+    except Exception:
+        pass  # No failure file — check for success
+
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         body = obj["Body"].read()
@@ -719,8 +740,8 @@ def _check_job(job: dict, s3):
     except Exception as e:
         if "NoSuchKey" in str(e) or "404" in str(e):
             _check_stale_and_resubmit(job, s3)
-            else:
-                logger.debug("Async job %s: S3 check error (will retry): %s", job["job_id"], e)
+        else:
+            logger.debug("Async job %s: S3 check error (will retry): %s", job["job_id"], e)
 
 
 def _update_progress(job: dict):
@@ -798,9 +819,16 @@ def _calculate_compute_cost(model_key: str, duration_seconds: float) -> float:
                 instance_type = reg_model["deployment"]["instance_type"]
                 default_rates = {
                     "ml.g5.xlarge": 1.41,
-                    "ml.g5.2xlarge": 1.52,
-                    "ml.g5.4xlarge": 2.03,
+                    "ml.g5.2xlarge": 2.82,
+                    "ml.g5.4xlarge": 4.44,
                     "ml.g6e.xlarge": 2.61,
+                    "ml.g6e.2xlarge": 5.22,
+                    "ml.g6e.4xlarge": 10.44,
+                    "ml.g6e.8xlarge": 20.88,
+                    "ml.g7e.2xlarge": 4.37,
+                    "ml.g7e.4xlarge": 5.19,
+                    "ml.g7e.8xlarge": 6.85,
+                    "ml.g7e.12xlarge": 10.75,
                 }
                 hourly_rate = default_rates.get(instance_type, 1.50)
                 break
@@ -852,30 +880,37 @@ _JOBS_S3_PREFIX = "artsmoker/async-jobs/"
 
 
 def _cleanup_s3(job: dict, s3):
-    """Delete ALL S3 artifacts for a completed/failed job: output, input, and job metadata."""
-    try:
-        from backend.services.sagemaker_deployer import get_deployment_s3_bucket, S3_MODEL_PREFIX
-        bucket = get_deployment_s3_bucket()
+    """Delete ALL S3 artifacts for a completed/failed job: output, input, and job metadata.
 
-        # 1. Delete output file
-        output_loc = job.get("output_location", "")
-        if output_loc:
+    Each delete is independent — a failure on one does not skip the others.
+    """
+    from backend.services.sagemaker_deployer import get_deployment_s3_bucket
+    bucket = get_deployment_s3_bucket()
+
+    # 1. Delete output file
+    output_loc = job.get("output_location", "")
+    if output_loc:
+        try:
             parts = output_loc.replace("s3://", "").split("/", 1)
             s3.delete_object(Bucket=parts[0], Key=parts[1])
+        except Exception as e:
+            logger.debug("S3 cleanup output for job %s: %s", job["job_id"], e)
 
-        # 2. Delete input file
-        input_loc = job.get("input_location", "")
-        if input_loc:
+    # 2. Delete input file
+    input_loc = job.get("input_location", "")
+    if input_loc:
+        try:
             parts = input_loc.replace("s3://", "").split("/", 1)
             s3.delete_object(Bucket=parts[0], Key=parts[1])
+        except Exception as e:
+            logger.debug("S3 cleanup input for job %s: %s", job["job_id"], e)
 
-        # 3. Delete persisted job metadata from S3
-        if bucket:
+    # 3. Delete persisted job metadata from S3
+    if bucket:
+        try:
             s3.delete_object(Bucket=bucket, Key=f"{_JOBS_S3_PREFIX}{job['job_id']}.json")
-
-        logger.debug("Cleaned up all S3 artifacts for job %s", job["job_id"])
-    except Exception as e:
-        logger.debug("S3 cleanup for job %s: %s", job["job_id"], e)
+        except Exception as e:
+            logger.debug("S3 cleanup metadata for job %s: %s", job["job_id"], e)
 
 
 def _persist_job_to_s3(job: dict):

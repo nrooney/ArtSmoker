@@ -32,11 +32,12 @@ Environment variables (set by deployer from catalog['invoke']):
   ENABLE_VAE_TILING: Process VAE in tiles (saves VRAM on large images)
 """
 
+import os
+
 import base64
 import io
 import json
 import logging
-import os
 import importlib
 
 import torch
@@ -101,7 +102,205 @@ def _clean_stale_quant_artifacts(comp_path: str):
             logger.warning("Failed to clean config.json in %s: %s", comp_path, e)
 
 
+# ── Block Offload Manager ────────────────────────────────────────────────
+# Generic GPU↔CPU block offloading with CUDA stream prefetching.
+# Standard PyTorch primitives: forward hooks, CUDA streams, non-blocking transfers.
+# Works with any model that has sequential transformer blocks (nn.ModuleList).
+
+class BlockOffloadManager:
+    """Offload transformer blocks to CPU with async CUDA stream prefetching.
+
+    CPU-first strategy (required for BnB INT8): Model loaded to CPU via
+    device_map="cpu". All blocks start on CPU. First N blocks moved to GPU
+    permanently. Remaining blocks shuttle CPU→GPU→CPU via forward hooks.
+    Async CUDA stream prefetches upcoming blocks to hide transfer latency.
+
+    BnB INT8 locks quantized weights to their initial device — .to("cpu")
+    silently fails after GPU placement. Loading to CPU first allows free
+    CPU↔GPU movement. This is the same technique used by ComfyUI/Diffusers
+    group_offloading to run 80B+ models on limited VRAM.
+    """
+
+    def __init__(self, layers, blocks_to_offload, prefetch_ahead=2, target_device="cuda"):
+        self.layers = layers
+        self.num_blocks = len(layers)
+        self.blocks_to_offload = min(blocks_to_offload, self.num_blocks)
+        self.prefetch_ahead = prefetch_ahead
+        self.target_device = target_device
+        self.offload_start = self.num_blocks - self.blocks_to_offload
+        self._hooks = []
+        self._enabled = False
+        self._prefetch_stream = None
+        self._prefetch_events = {}
+        self._block_devices = {}
+
+    def setup(self):
+        """Place blocks on correct devices and register forward hooks.
+
+        Expects model loaded to CPU (device_map="cpu"). Moves GPU-resident
+        blocks to GPU and pins offloaded blocks in CPU memory for fast DMA.
+        """
+        if self.blocks_to_offload <= 0:
+            return
+
+        self._prefetch_stream = torch.cuda.Stream(device=self.target_device)
+
+        for i in range(self.offload_start):
+            self.layers[i].to(self.target_device)
+            self._fix_bnb_state(self.layers[i])
+            self._block_devices[i] = self.target_device
+
+        for i in range(self.offload_start, self.num_blocks):
+            self._pin_block(self.layers[i])
+            self._block_devices[i] = "cpu"
+
+        for i, block in enumerate(self.layers):
+            pre = block.register_forward_pre_hook(
+                lambda mod, inp, idx=i: self._pre_forward(idx, mod, inp)
+            )
+            post = block.register_forward_hook(
+                lambda mod, inp, out, idx=i: self._post_forward(idx, mod, inp, out)
+            )
+            self._hooks.extend([pre, post])
+
+        self._enabled = True
+
+        block_size = self._estimate_block_size()
+        logger.info("Block offload (CPU-first): %d/%d blocks on CPU (%.1f GB each, ~%.1f GB freed), prefetch=%d",
+                     self.blocks_to_offload, self.num_blocks, block_size,
+                     self.blocks_to_offload * block_size, self.prefetch_ahead)
+
+    def _pin_block(self, block):
+        for param in block.parameters():
+            try:
+                if not param.data.is_pinned():
+                    param.data = param.data.pin_memory()
+            except Exception:
+                pass
+
+    def _estimate_block_size(self):
+        if self.offload_start < self.num_blocks:
+            block = self.layers[self.offload_start]
+            total = sum(p.numel() * p.element_size() for p in block.parameters())
+            return total / (1024**3)
+        return 0
+
+    def _pre_forward(self, block_idx, module, input):
+        if not self._enabled:
+            return
+
+        if block_idx in self._prefetch_events:
+            self._prefetch_events[block_idx].synchronize()
+            del self._prefetch_events[block_idx]
+            self._fix_bnb_state(module)
+            self._block_devices[block_idx] = self.target_device
+
+        if self._block_devices.get(block_idx) == "cpu":
+            module.to(self.target_device)
+            self._fix_bnb_state(module)
+            self._block_devices[block_idx] = self.target_device
+
+        for offset in range(1, self.prefetch_ahead + 1):
+            prefetch_idx = block_idx + offset
+            if (prefetch_idx < self.num_blocks and
+                prefetch_idx >= self.offload_start and
+                self._block_devices.get(prefetch_idx) == "cpu" and
+                prefetch_idx not in self._prefetch_events):
+                with torch.cuda.stream(self._prefetch_stream):
+                    self.layers[prefetch_idx].to(self.target_device, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(self._prefetch_stream)
+                    self._prefetch_events[prefetch_idx] = event
+
+    def _post_forward(self, block_idx, module, input, output):
+        if not self._enabled:
+            return
+        if block_idx >= self.offload_start:
+            module.to("cpu")
+            self._block_devices[block_idx] = "cpu"
+
+    def _fix_bnb_state(self, module):
+        """Fix BnB INT8 CB/SCB after device move.
+
+        Module._apply() (used by .to()) doesn't propagate BnB's CB/SCB
+        attributes. Re-alias them to match weight.data's device.
+        """
+        try:
+            import bitsandbytes as bnb
+            for child in module.modules():
+                if isinstance(child, bnb.nn.Linear8bitLt):
+                    w = child.weight
+                    if hasattr(w, 'CB') and w.CB is not None:
+                        if w.CB.device != w.data.device:
+                            w.CB = w.data
+                    if hasattr(w, 'SCB') and w.SCB is not None:
+                        if w.SCB.device != w.data.device:
+                            w.SCB = w.SCB.to(w.data.device)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug("BnB state fix: %s", e)
+
+    def enable(self):
+        self._enabled = True
+
+    def disable(self):
+        self._enabled = False
+        self._prefetch_events.clear()
+
+    def cleanup(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+        self._enabled = False
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
+
+def _cleanup_before_fallback(comp_name: str, pre_loaded: dict):
+    """Free GPU memory and references from a failed component load before retrying.
+
+    Aggressively clears GPU: removes reference from pre_loaded, runs garbage
+    collection, and empties CUDA cache. Called before every HuggingFace fallback.
+    """
+    if comp_name in pre_loaded:
+        try:
+            obj = pre_loaded.pop(comp_name)
+            del obj
+        except Exception:
+            pass
+    try:
+        import torch, gc
+        gc.collect()
+        gc.collect()  # Second pass catches ref cycles
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info("GPU after cleanup: %.1f GB allocated, %.1f GB reserved", allocated, reserved)
+    except Exception:
+        pass
+
+
+def _load_from_hf(comp_name, comp_subfolder, CompClass, load_kwargs, hf_token, pre_loaded):
+    """Single attempt to load a component from HuggingFace with quantization.
+
+    This is the final fallback — called once, never retried. If this fails,
+    the component is skipped (logged as error). The GPU placement logic
+    downstream handles missing components via model_cpu_offload.
+    """
+    hf_repo = _get_env("ARTSMOKER_HF_REPO")
+    if not hf_repo:
+        logger.error("No ARTSMOKER_HF_REPO set — cannot fall back to HuggingFace for %s", comp_name)
+        return
+    try:
+        pre_loaded[comp_name] = CompClass.from_pretrained(
+            hf_repo, subfolder=comp_subfolder, **load_kwargs,
+        )
+        logger.info("Loaded %s from HuggingFace (fallback)", comp_name)
+    except Exception as hf_err:
+        logger.error("HuggingFace load failed for %s: %s — component will be unquantized", comp_name, hf_err)
+
 
 def _decode_image(b64_string):
     return Image.open(io.BytesIO(base64.b64decode(b64_string)))
@@ -316,8 +515,21 @@ def _do_s3_cache_save(model_dict):
             pass  # No cache yet — proceed
 
         save_dir = "/tmp/model-save"
+        # Preserve early-saved quantized components (written during quantization loop).
+        # Only clean non-component files (stale model_index.json etc), not component dirs.
+        quant_comp_names = {
+            c.get("name") for c in _config.get("quantization_components", [])
+            if isinstance(c, dict)
+        }
         if os.path.exists(save_dir):
-            shutil.rmtree(save_dir)
+            for item in os.listdir(save_dir):
+                item_path = os.path.join(save_dir, item)
+                if item in quant_comp_names and os.path.isdir(item_path):
+                    continue  # Keep early-saved quantized component directories
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
         os.makedirs(save_dir, exist_ok=True)
 
         t0 = _time.time()
@@ -409,6 +621,13 @@ def _do_s3_cache_save(model_dict):
                     logger.info("✓ %s: quantization_config.json present (NF4 preserved)", comp.get("name"))
                 else:
                     logger.warning("✗ %s: NO quantization_config.json — will need re-quantization on load", comp.get("name"))
+
+        # If no components have quantization_config.json, the cache still contains
+        # valid weights (likely NF4 packed, just missing metadata due to diffusers bug).
+        # Save anyway — the workaround above should fix this, but if not, bf16 cache
+        # can still be re-quantized on load.
+        if quantized_components and not any(c["preserved"] for c in quantized_components):
+            logger.warning("No quantization_config.json found — cache will need re-quantization on load")
 
         cache_info = {
             "version_key": _get_cache_version_key(),
@@ -614,19 +833,35 @@ def _load_diffusers(model_dir):
                 if comp_path:
                     preserved = _is_component_preserved(comp_name)
                     if preserved:
-                        # NF4 weights with BnB metadata preserved — load directly (fast)
-                        logger.info("Loading %s from cache: NF4 preserved, direct load", comp_name)
-                        pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
+                        try:
+                            logger.info("Loading %s from cache: NF4 preserved, direct load", comp_name)
+                            preserved_kwargs = {"torch_dtype": _get_torch_dtype()}
+                            if hf_token:
+                                preserved_kwargs["token"] = hf_token
+                            pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **preserved_kwargs)
+                        except Exception as cache_err:
+                            logger.warning("Preserved load failed for %s: %s — retrying with re-quantization", comp_name, cache_err)
+                            _cleanup_before_fallback(comp_name, pre_loaded)
+                            _clean_stale_quant_artifacts(comp_path)
+                            try:
+                                pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
+                                logger.info("Re-quantized %s from cache (fallback)", comp_name)
+                            except Exception as requant_err:
+                                logger.warning("Cache re-quantize failed for %s: %s — falling back to HuggingFace", comp_name, requant_err)
+                                _cleanup_before_fallback(comp_name, pre_loaded)
+                                _load_from_hf(comp_name, comp_subfolder, CompClass, load_kwargs, hf_token, pre_loaded)
                     else:
-                        # bf16 weights — clean stale BnB artifacts and re-quantize on the fly.
-                        # BnB will treat these as fresh bf16 weights and quantize to NF4,
-                        # same as a fresh HF download but from local disk (faster).
                         _clean_stale_quant_artifacts(comp_path)
-                        logger.info("Loading %s from cache: bf16 → re-quantizing to %s (NF4 not preserved)", comp_name, comp_quant)
-                        pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
+                        logger.info("Loading %s from cache: re-quantizing to %s (not preserved)", comp_name, comp_quant)
+                        try:
+                            pre_loaded[comp_name] = CompClass.from_pretrained(comp_path, **load_kwargs)
+                        except Exception as requant_err:
+                            logger.warning("Cache re-quantize failed for %s: %s — falling back to HuggingFace", comp_name, requant_err)
+                            _cleanup_before_fallback(comp_name, pre_loaded)
+                            _load_from_hf(comp_name, comp_subfolder, CompClass, load_kwargs, hf_token, pre_loaded)
                 else:
-                    logger.warning("Cache missing component %s — will load from pipeline (UNQUANTIZED)", comp_name)
-                    continue
+                    logger.warning("Cache missing component %s — loading from HuggingFace", comp_name)
+                    _load_from_hf(comp_name, comp_subfolder, CompClass, load_kwargs, hf_token, pre_loaded)
             else:
                 pre_loaded[comp_name] = CompClass.from_pretrained(
                     model_source, subfolder=comp_subfolder, **load_kwargs,
@@ -634,17 +869,59 @@ def _load_diffusers(model_dir):
 
             logger.info("Loaded %s with %s quantization (from_cache=%s)", comp_name, comp_quant, _loaded_from_cache)
 
-            # CRITICAL: Save quantized component IMMEDIATELY, before pipeline assembly
-            # or model_cpu_offload can strip BnB metadata. save_pretrained() on a freshly
-            # quantized component writes quantization_config.json. After pipeline assembly
-            # + offloading, this metadata is lost and save reverts to full precision.
+            # Save component IMMEDIATELY after quantization, before pipeline assembly.
+            # Diffusers models (Flux2Transformer2DModel) write real NF4 packed weights
+            # with BnB quant_state in safetensors. Transformers models (Mistral3) do NOT —
+            # they save bf16 without quant_state. We verify by checking safetensors for
+            # bitsandbytes__* keys before writing quantization_config.json.
             if not _loaded_from_cache and _get_env("ARTSMOKER_CACHE_BUCKET"):
                 _early_save_dir = "/tmp/model-save"
                 comp_save_dir = os.path.join(_early_save_dir, comp_name)
                 try:
                     os.makedirs(comp_save_dir, exist_ok=True)
                     pre_loaded[comp_name].save_pretrained(comp_save_dir)
+
+                    # Check if safetensors actually contain BnB quant_state metadata.
+                    # Only write quantization_config.json if they do — otherwise the
+                    # loader will try to load bf16 weights as pre-quantized NF4 and fail.
                     qconfig_path = os.path.join(comp_save_dir, "quantization_config.json")
+                    has_real_nf4 = False
+                    if not os.path.exists(qconfig_path):
+                        for fname in os.listdir(comp_save_dir):
+                            if fname.endswith(".safetensors"):
+                                try:
+                                    from safetensors import safe_open
+                                    with safe_open(os.path.join(comp_save_dir, fname), framework="pt") as sf:
+                                        keys = sf.keys()
+                                        if any("bitsandbytes" in k for k in keys):
+                                            has_real_nf4 = True
+                                            break
+                                except Exception:
+                                    pass
+
+                        if has_real_nf4:
+                            qconfig_data = {
+                                "load_in_4bit": comp_quant in ("int4", "4bit", "nf4"),
+                                "load_in_8bit": comp_quant in ("int8", "8bit"),
+                                "bnb_4bit_quant_type": "nf4" if comp_quant in ("int4", "4bit", "nf4") else None,
+                                "bnb_4bit_compute_dtype": "bfloat16",
+                                "bnb_4bit_use_double_quant": False,
+                                "bnb_4bit_quant_storage": "uint8",
+                                "quant_method": "bitsandbytes",
+                            }
+                            with open(qconfig_path, "w") as _f:
+                                json.dump(qconfig_data, _f, indent=2)
+                            config_path = os.path.join(comp_save_dir, "config.json")
+                            if os.path.exists(config_path):
+                                with open(config_path, "r") as _f:
+                                    cfg = json.load(_f)
+                                cfg["quantization_config"] = qconfig_data
+                                with open(config_path, "w") as _f:
+                                    json.dump(cfg, _f, indent=2)
+                            logger.info("Verified NF4 quant_state in safetensors — wrote quantization_config.json")
+                        else:
+                            logger.info("No BnB quant_state in safetensors — saved as bf16 (will re-quantize on load)")
+
                     has_qc = os.path.exists(qconfig_path)
                     comp_size = sum(
                         os.path.getsize(os.path.join(r, f))
@@ -656,8 +933,9 @@ def _load_diffusers(model_dir):
                     logger.warning("Early save failed for %s: %s", comp_name, save_err)
 
         except Exception as e:
-            logger.warning("Quantization failed for %s (%s), falling back to full precision: %s",
-                          comp_name, comp_quant, e)
+            logger.warning("Component load failed for %s (%s): %s — trying HuggingFace", comp_name, comp_quant, e)
+            _cleanup_before_fallback(comp_name, pre_loaded)
+            _load_from_hf(comp_name, comp_subfolder, CompClass, load_kwargs, hf_token, pre_loaded)
 
     # Multi-GPU: load transformer with device_map to split across GPUs
     device_map = _config.get("device_map", "")
@@ -706,31 +984,28 @@ def _load_diffusers(model_dir):
             fallback_kwargs.update(pre_loaded)
         pipe = PipelineClass.from_pretrained(fallback_source, **fallback_kwargs)
 
-    # GPU placement strategy for quantized models:
-    # device_map="balanced" causes CUDA illegal memory access when text encoder is on CPU
-    # and transformer is on GPU (cross-device tensor operations fail).
-    # model_cpu_offload is the correct approach: moves ONE component at a time to GPU,
-    # runs its forward pass, then moves it back. Each component gets full GPU access.
-    # With bf16 text encoder (~22 GB) + NF4 transformer (~10 GB), each fits on 44.5 GB L40S.
-    # Speed: text encoding once (~15s) + 28 denoising steps (~3-4 min) = ~3.5 min total.
+    # GPU placement strategy:
+    # - All NF4 quantized (fresh or cached) → pipe.to("cuda") = fast path (30-60s/image)
+    #   NF4 components are already on GPU from quantization. ~15 GB total fits easily.
+    # - Fallback from failed quantization (full bf16) → model_cpu_offload (prevents OOM)
     has_quantized = bool(pre_loaded)
     all_quantized = has_quantized and len(pre_loaded) == len([
         c for c in _config.get("quantization_components", []) if isinstance(c, dict)
     ])
+    expects_quantization = bool(_config.get("quantization_components"))
 
     if device_map:
         logger.info("Skipping .to(cuda)/offload — model placed by device_map")
-    elif all_quantized and _all_preserved_from_cache:
-        # All components have PRESERVED NF4 weights loaded from cache — already compact,
-        # loaded directly to GPU (no device_map="cpu" needed for preserved NF4).
-        # Total ~16 GB NF4 fits easily on 44.5+ GB L40S GPU.
-        # This is the fast path: ~30-60s/image instead of ~5 min with model_cpu_offload.
-        logger.info("All components NF4 preserved from cache — moving pipeline to GPU (fast inference)")
+    elif all_quantized:
+        # All expected components are NF4 quantized (on GPU). Total ~15 GB fits on 44.5+ GB.
+        logger.info("All components NF4 quantized — moving pipeline to GPU (fast inference)")
         pipe.to("cuda")
     elif has_quantized:
-        # Quantized components loaded to CPU (fresh build OR cache re-quantization).
-        # Use model_cpu_offload to move one at a time — slower but safe.
-        logger.info("Quantized components on CPU — using model_cpu_offload")
+        # Partial quantization — some components on GPU, some not. Use offload for safety.
+        logger.info("Partial quantization — using model_cpu_offload")
+        pipe.enable_model_cpu_offload()
+    elif expects_quantization and not has_quantized:
+        logger.warning("Quantization expected but none succeeded — using model_cpu_offload (bf16 too large for GPU)")
         pipe.enable_model_cpu_offload()
     elif _get_env_bool("ENABLE_MODEL_CPU_OFFLOAD"):
         logger.info("Enabling model CPU offload (keeps only active component on GPU)")
@@ -845,9 +1120,136 @@ def _load_codeformer(model_dir):
     return {"library": "codeformer", "model_dir": model_dir}
 
 
+def _load_autoregressive(model_dir):
+    """Load an autoregressive image model (e.g., HunyuanImage 3.0).
+
+    Unlike diffusers pipelines, these models use AutoModelForCausalLM with
+    custom generation methods. The model-specific behavior (generate method
+    name, tokenizer loading, block swap) comes from invoke_config.json.
+
+    Block offload strategy (CPU-first):
+      BnB INT8 locks quantized weights to their initial device. Loading to
+      GPU first makes .to("cpu") silently fail. Instead, we load the entire
+      model to CPU (device_map="cpu"), then selectively move components:
+        - Non-block components (embed, norm, lm_head) → GPU permanently (~5 GB)
+        - First N-K blocks → GPU permanently
+        - Last K blocks → stay on CPU, shuttle to GPU via forward hooks
+      This is the same technique used by ComfyUI to run 80B+ models on 24 GB.
+    """
+    from transformers import AutoModelForCausalLM
+
+    model_source = _resolve_model_source(model_dir)
+    hf_token = _get_env("HUGGING_FACE_HUB_TOKEN") or None
+
+    trust_remote = _config.get("trust_remote_code", False)
+    attn_impl = _config.get("attn_implementation", "sdpa")
+    moe_impl = _config.get("moe_impl", "eager")
+    moe_drop = _config.get("moe_drop_tokens", True)
+    torch_dtype = _config.get("torch_dtype", "auto")
+    block_swap_blocks = _config.get("block_swap_blocks", 0)
+
+    logger.info("Loading autoregressive model from %s (trust_remote=%s, attn=%s, moe=%s, block_swap=%d)",
+                model_source, trust_remote, attn_impl, moe_impl, block_swap_blocks)
+
+    load_kwargs = {
+        "torch_dtype": torch_dtype,
+        "attn_implementation": attn_impl,
+    }
+    if trust_remote:
+        load_kwargs["trust_remote_code"] = True
+    if moe_impl:
+        load_kwargs["moe_impl"] = moe_impl
+    if moe_drop is not None:
+        load_kwargs["moe_drop_tokens"] = moe_drop
+    if hf_token:
+        load_kwargs["token"] = hf_token
+
+    # CPU-first loading: required for block offload with BnB INT8.
+    # Without this, BnB locks quantized weights to GPU and .to("cpu") silently fails.
+    if block_swap_blocks > 0:
+        load_kwargs["device_map"] = "cpu"
+        logger.info("CPU-first load: device_map='cpu' (block offload will place selectively)")
+
+    model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
+
+    if hasattr(model, "load_tokenizer"):
+        logger.info("Loading custom tokenizer from %s", model_source)
+        model.load_tokenizer(model_source)
+    else:
+        logger.info("No custom tokenizer loader — using standard tokenizer")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_source, trust_remote_code=trust_remote, token=hf_token
+        )
+        model._tokenizer = tokenizer
+
+    block_offload = None
+    prefetch_ahead = _config.get("block_swap_prefetch", 2)
+
+    if block_swap_blocks > 0 and hasattr(model, "model") and hasattr(model.model, "layers"):
+        model.eval()
+
+        # Move non-block components to GPU permanently.
+        # These are small (~5 GB total): embeddings, final norm, lm_head, etc.
+        inner = model.model
+        moved_components = []
+        for name, child in inner.named_children():
+            if name == "layers":
+                continue
+            try:
+                child.to("cuda")
+                moved_components.append(name)
+            except Exception as e:
+                logger.warning("Could not move %s to GPU: %s", name, e)
+
+        # Move lm_head and any other top-level non-model children to GPU
+        for name, child in model.named_children():
+            if name == "model":
+                continue
+            try:
+                child.to("cuda")
+                moved_components.append(name)
+            except Exception as e:
+                logger.warning("Could not move %s to GPU: %s", name, e)
+
+        logger.info("Moved non-block components to GPU: %s", moved_components)
+
+        # BlockOffloadManager moves first N-K blocks to GPU, keeps last K on CPU
+        block_offload = BlockOffloadManager(
+            inner.layers, block_swap_blocks,
+            prefetch_ahead=prefetch_ahead, target_device="cuda"
+        )
+        block_offload.setup()
+
+        gpu_alloc = torch.cuda.memory_allocated(0) / (1024**3) if torch.cuda.is_available() else 0
+        logger.info("After block offload setup: %.1f GB GPU allocated", gpu_alloc)
+    else:
+        try:
+            model.to("cuda")
+            logger.info("Model moved to GPU (no block offload)")
+        except (ValueError, RuntimeError) as move_err:
+            if "8-bit" in str(move_err) or "not supported" in str(move_err):
+                logger.info("Model already on correct device (pre-quantized)")
+            else:
+                raise
+        model.eval()
+
+    gpu_alloc = torch.cuda.memory_allocated(0) / (1024**3) if torch.cuda.is_available() else 0
+    logger.info("Autoregressive model loaded: %.1f GB GPU allocated", gpu_alloc)
+
+    return {
+        "library": "autoregressive",
+        "model": model,
+        "block_offload": block_offload,
+        "generate_method": _config.get("generate_method", "generate_image"),
+        "bot_task": _config.get("bot_task", "image"),
+    }
+
+
 _LOADERS = {
     "diffusers": _load_diffusers,
     "transformers": _load_transformers,
+    "autoregressive": _load_autoregressive,
     "realesrgan": _load_realesrgan,
     "codeformer": _load_codeformer,
 }
@@ -870,7 +1272,25 @@ def _predict_text_to_image(input_data, model_dict):
         if key in input_data and input_data[key] is not None:
             kwargs[key] = input_data[key]
 
-    result = pipe(**kwargs)
+    # Progress logging for diffusers pipelines
+    total_steps = kwargs.get("num_inference_steps", 50)
+    import time as _t
+    _step_start = _t.time()
+
+    def _log_progress(pipe, step, timestep, callback_kwargs):
+        elapsed = _t.time() - _step_start
+        pct = int((step + 1) / total_steps * 100)
+        if step == 0 or (step + 1) % 5 == 0 or step + 1 == total_steps:
+            logger.info("Diffusion step %d/%d (%d%%) — %.1fs elapsed", step + 1, total_steps, pct, elapsed)
+        return callback_kwargs
+
+    try:
+        kwargs["callback_on_step_end"] = _log_progress
+        result = pipe(**kwargs)
+    except TypeError:
+        del kwargs["callback_on_step_end"]
+        result = pipe(**kwargs)
+
     return _encode_image(result.images[0])
 
 
@@ -967,8 +1387,105 @@ def _predict_face_restoration(input_data, model_dict):
     return _encode_image(_decode_image(input_data["image"]))
 
 
+def _predict_autoregressive_image(input_data, model_dict):
+    """Generate an image from an autoregressive model (e.g., HunyuanImage 3.0).
+
+    The model uses generate_image() (or whatever generate_method is configured)
+    instead of a diffusers pipeline __call__. Returns a PIL.Image which we
+    convert to base64 PNG.
+    """
+    model = model_dict["model"]
+    generate_method = model_dict.get("generate_method", "generate_image")
+    bot_task = model_dict.get("bot_task", "image")
+
+    prompt = input_data.get("prompt", "")
+    width = input_data.get("width", 1024)
+    height = input_data.get("height", 1024)
+    steps = input_data.get("num_inference_steps", _config.get("input_fields", {}).get("num_inference_steps", {}).get("default", 50))
+    guidance = input_data.get("guidance_scale", _config.get("input_fields", {}).get("guidance_scale", {}).get("default", 5.0))
+    seed = input_data.get("seed")
+
+    # HunyuanImage expects "HxW" format (height first), not "WxH"
+    image_size_format = _config.get("image_size_format", "HxW")
+    if image_size_format == "WxH":
+        image_size = f"{width}x{height}"
+    else:
+        image_size = f"{height}x{width}"
+
+    gen_fn = getattr(model, generate_method, None)
+    if not gen_fn:
+        raise ValueError(f"Model has no '{generate_method}' method. Available: {[m for m in dir(model) if 'generat' in m.lower()]}")
+
+    logger.info("Autoregressive generation: size=%s, steps=%d, guidance=%.1f, seed=%s, bot_task=%s",
+                image_size, steps, guidance, seed, bot_task)
+
+    import time as _t, threading
+
+    # Background progress logger — since autoregressive models don't emit step callbacks,
+    # log elapsed time periodically so CloudWatch shows the job is alive.
+    _gen_done = threading.Event()
+    _gen_start = _t.time()
+
+    def _progress_logger():
+        while not _gen_done.is_set():
+            _gen_done.wait(30)  # Log every 30 seconds
+            if not _gen_done.is_set():
+                elapsed = _t.time() - _gen_start
+                logger.info("Autoregressive generation in progress — %.0fs elapsed (%s, %d steps)",
+                            elapsed, image_size, steps)
+
+    progress_thread = threading.Thread(target=_progress_logger, daemon=True)
+    progress_thread.start()
+
+    gen_kwargs = {
+        "prompt": prompt,
+        "image_size": image_size,
+        "diff_infer_steps": steps,
+        "bot_task": bot_task,
+    }
+    if seed is not None:
+        gen_kwargs["seed"] = seed
+
+    # Enable block offload hooks during generation (if configured)
+    block_offload = model_dict.get("block_offload")
+    if block_offload:
+        block_offload.enable()
+        logger.info("Block offload enabled for inference")
+
+    try:
+        result = gen_fn(**gen_kwargs)
+    finally:
+        if block_offload:
+            block_offload.disable()
+        _gen_done.set()
+        elapsed = _t.time() - _gen_start
+        logger.info("Autoregressive generation finished — %.1fs total", elapsed)
+
+    # Result format varies by model. HunyuanImage returns (cot_text, [PIL.Image, ...])
+    if isinstance(result, tuple) and len(result) == 2:
+        cot_text, samples = result
+        if cot_text:
+            logger.info("CoT reasoning: %s", cot_text[:200])
+        image = samples[0] if samples else None
+    elif isinstance(result, list):
+        image = result[0] if result else None
+    else:
+        image = result
+
+    if image is None:
+        raise RuntimeError("Model returned no image")
+
+    if hasattr(image, "save"):
+        return _encode_image(image)
+    elif isinstance(image, str):
+        return image
+    else:
+        raise RuntimeError(f"Unexpected output type: {type(image)}")
+
+
 _PREDICTORS = {
     "text_to_image": _predict_text_to_image,
+    "autoregressive_image": _predict_autoregressive_image,
     "image_to_video": _predict_image_to_video,
     "image_upscale": _predict_image_upscale,
     "background_removal": _predict_background_removal,

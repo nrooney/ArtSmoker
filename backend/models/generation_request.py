@@ -59,7 +59,10 @@ class GenerationRequest(BaseModel):
     generate_svg: bool = True
     upscale: bool = False
     negative_prompt: str = ""  # Carried from Compose step when pre_composed=True
-    all_models: bool = False  # Generate with all enabled image models (one per option)
+    decomposed_data: dict | None = None  # From Prompt Designer — persisted to metadata
+    recomposed_prompt: str | None = None  # From Prompt Designer recompose step
+    all_models: bool = False  # Generate with multiple models (all enabled or selected subset)
+    selected_models: list[str] | None = None  # Specific model keys for multi-model generation
     model_optimized_prompts: bool = False  # Tailor prompts per model (only when all_models=True)
     ip_owned: bool = False
     ip_licensed: bool = False

@@ -46,6 +46,7 @@
         _selectedOption: 0,
         _selectedVariant: 0,
         _lastNegativePrompt: '',
+        _selectedModels: [],
 
         render() {
             return `
@@ -83,12 +84,16 @@
 
                                 <div>
                                     <label class="block text-sm font-medium mb-1.5">${t('image_studio.model')}</label>
-                                    <select id="gen-model" class="input">
-                                        ${MODELS.map(m => `<option value="${m.value}">${m.label}</option>`).join('')}
-                                    </select>
+                                    <div id="gen-model-multi" class="relative">
+                                        <button id="gen-model-btn" type="button" class="input text-left flex items-center justify-between w-full cursor-pointer">
+                                            <span id="gen-model-label" class="truncate text-sm">Select models...</span>
+                                            <svg class="w-4 h-4 text-brand-text-muted flex-shrink-0 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                                        </button>
+                                        <div id="gen-model-dropdown" class="hidden absolute z-50 mt-1 w-full max-h-60 overflow-y-auto rounded-lg border border-brand-border shadow-xl" style="background: var(--bg, #0f172a)"></div>
+                                    </div>
                                     <!-- Smart summary line -->
                                     <p id="gen-model-summary" class="text-[10px] text-brand-text-dim mt-1"></p>
-                                    <!-- All Models mode options -->
+                                    <!-- Multi-model mode options -->
                                     <div id="gen-all-models-opts" class="hidden mt-2 p-2 rounded-lg bg-brand-bg/50 space-y-1.5">
                                         <label class="flex items-center gap-2 text-xs text-brand-text-muted cursor-pointer">
                                             <input type="checkbox" id="gen-model-optimized" class="rounded" checked />
@@ -377,6 +382,18 @@
             this._loadModels();  // Refresh model list (picks up newly deployed custom models)
             this._loadStyles();
             this._ensurePromptEditor();
+            // Re-render results if async jobs completed while we were on another view
+            if (this._result?.options) {
+                const hasNewImages = this._result.options.some(opt =>
+                    (opt.variants || []).some(v => v.png_path && !v.async_job)
+                );
+                if (hasNewImages) {
+                    this._renderOptionsRow(this._result.options);
+                    this._selectOption(this._selectedOption || 0);
+                }
+            }
+            // One-time check — if active jobs found, polling resumes. If not, stops.
+            this._checkAsyncJobs();
         },
 
         _ensurePromptEditor() {
@@ -390,7 +407,7 @@
                     this._promptEditor = new PromptEditor(container, {
                         styleId: this._getStyleId(),
                         assetType: this._getAssetType(),
-                        imageModel: document.getElementById('gen-model')?.value,
+                        imageModel: (this._selectedModels?.[0] || ''),
                         onAssetTypeChange: (newType) => {
                             const sel = document.getElementById('gen-asset-type');
                             if (sel) {
@@ -420,31 +437,72 @@
             document.getElementById('gen-asset-type')?.addEventListener('change', () => {
                 if (this._promptEditor) this._promptEditor.setContext({ assetType: this._getAssetType() });
             });
-            // Model change: update quality options, region, and summary
-            document.getElementById('gen-model')?.addEventListener('change', () => {
-                const modelVal = document.getElementById('gen-model')?.value;
-                if (this._promptEditor) this._promptEditor.setContext({ imageModel: modelVal });
-                this._updateAllModelsUI(modelVal === 'all_models');
-                this._updateQualityForModel(modelVal);
-                this._updateRegionForModel(modelVal);
-                this._updateModelSummary();
+            // Multi-select model dropdown: toggle open/close
+            // Multi-select dropdown: toggle
+            document.getElementById('gen-model-btn')?.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const dd = document.getElementById('gen-model-dropdown');
+                if (!dd) return;
+                const wasOpen = !dd.classList.contains('hidden');
+                dd.classList.toggle('hidden');
+                // If closing and nothing selected, auto-select first
+                if (wasOpen && !this._selectedModels.length) {
+                    const realModels = MODELS.filter(m => m.value !== 'all_models');
+                    if (realModels.length) {
+                        this._selectedModels = [realModels[0].value];
+                        this._syncModelCheckboxes();
+                        window.showToast?.(`Selected ${realModels[0].label} — at least one model is required`, 'info');
+                    }
+                }
+            });
+            // Close dropdown on outside click — auto-select first model if empty
+            document.addEventListener('click', (e) => {
+                if (!e.target.closest('#gen-model-multi')) {
+                    const dd = document.getElementById('gen-model-dropdown');
+                    if (dd && !dd.classList.contains('hidden')) {
+                        dd.classList.add('hidden');
+                        if (!this._selectedModels.length) {
+                            const realModels = MODELS.filter(m => m.value !== 'all_models');
+                            if (realModels.length) {
+                                this._selectedModels = [realModels[0].value];
+                                this._syncModelCheckboxes();
+                                window.showToast?.(`Selected ${realModels[0].label} — at least one model is required`, 'info');
+                            }
+                        }
+                    }
+                }
+            });
+            // Checkbox change handler (delegated) — allows unchecking everything
+            document.getElementById('gen-model-dropdown')?.addEventListener('change', (e) => {
+                const cb = e.target;
+                if (cb.id === 'gen-model-all') {
+                    const realModels = MODELS.filter(m => m.value !== 'all_models');
+                    this._selectedModels = cb.checked ? realModels.map(m => m.value) : [];
+                } else if (cb.classList.contains('gen-model-cb')) {
+                    if (cb.checked) {
+                        if (!this._selectedModels.includes(cb.value)) this._selectedModels.push(cb.value);
+                    } else {
+                        this._selectedModels = this._selectedModels.filter(v => v !== cb.value);
+                    }
+                }
+                // Update prompt editor context with first selected model
+                if (this._promptEditor && this._selectedModels.length) {
+                    this._promptEditor.setContext({ imageModel: this._selectedModels[0] });
+                }
+                this._syncModelCheckboxes();
             });
 
             // Quality change: update region prices + summary
             document.getElementById('gen-quality')?.addEventListener('change', () => {
-                this._updateRegionForModel(document.getElementById('gen-model')?.value);
-                this._updateModelSummary();
+                if (this._selectedModels.length === 1) {
+                    this._updateRegionForModel(this._selectedModels[0]);
+                }
+                this._updateMultiModelCostEstimate();
             });
-            document.getElementById('gen-region')?.addEventListener('change', () => this._updateModelSummary());
-            document.getElementById('gen-size')?.addEventListener('change', () => this._updateModelSummary());
-            document.getElementById('gen-num-options')?.addEventListener('change', () => {
-                this._updateModelSummary();
-                if (this._isAllModels()) this._updateAllModelsEstimate();
-            });
-            document.getElementById('gen-num-variations')?.addEventListener('change', () => {
-                this._updateModelSummary();
-                if (this._isAllModels()) this._updateAllModelsEstimate();
-            });
+            document.getElementById('gen-region')?.addEventListener('change', () => this._updateMultiModelCostEstimate());
+            document.getElementById('gen-size')?.addEventListener('change', () => this._updateMultiModelCostEstimate());
+            document.getElementById('gen-num-options')?.addEventListener('change', () => this._updateMultiModelCostEstimate());
+            document.getElementById('gen-num-variations')?.addEventListener('change', () => this._updateMultiModelCostEstimate());
             document.getElementById('btn-generate')?.addEventListener('click', () => this._handleGenerate());
             document.getElementById('btn-model-settings')?.addEventListener('click', () => ModelSettings.open('image-studio'));
             document.getElementById('btn-pending-jobs')?.addEventListener('click', () => this._showPendingJobs());
@@ -470,7 +528,6 @@
             };
             document.getElementById('gen-ip-own')?.addEventListener('change', updateIpNote);
             document.getElementById('gen-ip-license')?.addEventListener('change', updateIpNote);
-            document.getElementById('gen-model')?.addEventListener('change', updateIpNote);
             document.getElementById('btn-apply-postprocess')?.addEventListener('click', () => this._handlePostProcess());
 
             // Click on preview image → open AssetViewer with zoom/pan and full metadata
@@ -515,6 +572,14 @@
             if (previewImg) previewImg.style.cursor = 'pointer';
             document.getElementById('btn-reset')?.addEventListener('click', async () => {
                 if (this._result && !await window.showConfirm(t('image_studio.reset_confirm'), { title: t('image_studio.reset'), detail: t('image_studio.reset_detail'), confirmLabel: t('image_studio.reset'), danger: true })) return;
+                // Clear all state before rebuilding the view
+                this._result = null;
+                this._selectedOption = 0;
+                this._selectedVariant = 0;
+                this._lastNegativePrompt = '';
+                this._promptEditor = null;
+                this._stopAsyncPolling();
+                this._notifiedJobIds = new Set();
                 window.PromptDesigner?.reset();
                 window.resetView('image-studio');
             });
@@ -537,6 +602,7 @@
                         quality_options: m.quality_options || [],
                         default_quality: m.default_quality || '',
                         base_price_usd: m.base_price_usd || null,
+                        supported_sizes: m.supported_sizes || null,
                     }));
                     // Append the virtual "All Available Models" entry
                     MODELS.push({ value: 'all_models', label: '\u2500\u2500 All Available Models' });
@@ -552,25 +618,38 @@
                 console.warn('Failed to load image models from registry, using fallback:', err);
             }
 
-            // Repopulate the model dropdown
-            const sel = document.getElementById('gen-model');
-            if (!sel) return;
-            const currentValue = sel.value;
-            sel.innerHTML = '';
-            MODELS.forEach(m => {
-                const opt = document.createElement('option');
-                opt.value = m.value;
-                opt.textContent = m.label;
-                sel.appendChild(opt);
+            // Populate the multi-select checkbox dropdown
+            const dropdown = document.getElementById('gen-model-dropdown');
+            if (!dropdown) return;
+            dropdown.innerHTML = '';
+            const realModels = MODELS.filter(m => m.value !== 'all_models');
+
+            realModels.forEach((m, idx) => {
+                const row = document.createElement('label');
+                row.className = 'flex items-center gap-2 text-xs cursor-pointer py-1.5 px-3 hover:bg-brand-bg/60';
+                row.innerHTML = `<input type="checkbox" class="gen-model-cb rounded border-brand-border" value="${m.value}" data-idx="${idx}" />
+                    <span class="truncate">${m.label}</span>`;
+                dropdown.appendChild(row);
             });
-            // Restore selection if it still exists, otherwise use first
-            if (currentValue && [...sel.options].some(o => o.value === currentValue)) {
-                sel.value = currentValue;
+
+            // "All Available Models" toggle at the bottom
+            const sep = document.createElement('div');
+            sep.className = 'border-t border-brand-border/50 mt-1 pt-1 px-3 pb-1';
+            sep.innerHTML = `<label class="flex items-center gap-2 text-xs cursor-pointer py-1 hover:bg-brand-bg/60 rounded px-1">
+                <input type="checkbox" id="gen-model-all" class="rounded border-brand-border" />
+                <span class="text-brand-text-muted">\u2500\u2500 ${t('image_studio.all_models') || 'All Available Models'}</span>
+            </label>`;
+            dropdown.appendChild(sep);
+
+            // Restore or initialize selection — keep valid previously selected models
+            if (this._selectedModels.length) {
+                const validKeys = new Set(realModels.map(m => m.value));
+                this._selectedModels = this._selectedModels.filter(k => validKeys.has(k));
             }
-            // Update quality, region, and summary for the selected model
-            this._updateQualityForModel(sel.value);
-            this._updateRegionForModel(sel.value);
-            this._updateModelSummary();
+            if (!this._selectedModels.length && realModels.length) {
+                this._selectedModels = [realModels[0].value];
+            }
+            this._syncModelCheckboxes();
         },
 
         _updateQualityForModel(modelKey) {
@@ -605,7 +684,7 @@
             const costEl = document.getElementById('gen-cost-estimate');
             if (!summaryEl) return;
 
-            const modelKey = document.getElementById('gen-model')?.value;
+            const modelKey = (this._selectedModels?.[0] || '');
             if (modelKey === 'all_models') {
                 summaryEl.textContent = '';
                 if (costEl) costEl.textContent = '';
@@ -771,7 +850,30 @@
                 : userPrompt;
 
             const sizeIdx = parseInt(document.getElementById('gen-size').value, 10);
-            const size = SIZE_PRESETS[sizeIdx] || SIZE_PRESETS[2];
+            const activeSizes = this._activeSizePresets || SIZE_PRESETS;
+            const size = activeSizes[sizeIdx] || activeSizes[Math.min(2, activeSizes.length - 1)];
+
+            // Check if any selected model doesn't support the chosen dimensions
+            const unsupportedModels = this._selectedModels.map(key => {
+                const m = MODELS.find(m => m.value === key);
+                if (!m?.supported_sizes?.length) return null;
+                const match = m.supported_sizes.some(s => s.w === size.w && s.h === size.h);
+                return match ? null : m;
+            }).filter(Boolean);
+
+            if (unsupportedModels.length > 0 && window.showConfirm) {
+                const modelNames = unsupportedModels.map(m => m.label).join(', ');
+                const shouldContinue = await window.showConfirm(
+                    `${modelNames} ${unsupportedModels.length === 1 ? 'does' : 'do'} not support ${size.label}. The closest supported size will be used for ${unsupportedModels.length === 1 ? 'this model' : 'these models'}.`,
+                    {
+                        title: 'Dimension not supported by all models',
+                        confirmLabel: 'Continue anyway',
+                        cancelLabel: 'Change dimensions',
+                    }
+                );
+                if (!shouldContinue) return;
+            }
+
             const numOptions = parseInt(document.getElementById('gen-num-options').value, 10) || 5;
             const numVariations = parseInt(document.getElementById('gen-num-variations').value, 10) || 5;
             const total = numOptions * numVariations;
@@ -781,7 +883,17 @@
             // Carry the negative prompt from the Compose step (if user pre-composed)
             const composedNegative = this._promptEditor?.getNegativePrompt?.() || '';
 
-            const isAllModels = this._isAllModels();
+            const isMultiModel = this._isAllModels();
+
+            // Validate model selection
+            if (!this._selectedModels.length) {
+                window.showToast?.(t('image_studio.select_at_least_one_model') || 'Select at least one model', 'error');
+                return;
+            }
+
+            // Include Prompt Designer data if available (so backend doesn't re-decompose)
+            const decomposedData = this._promptEditor?._decomposedData || null;
+            const recomposedPrompt = this._promptEditor?._recomposedPrompt || null;
 
             const payload = {
                 prompt: hasComposed ? prompt : userPrompt,
@@ -789,11 +901,14 @@
                 pre_composed: hasComposed || false,
                 moderation_original: moderationOriginal || null,
                 negative_prompt: composedNegative,
-                all_models: isAllModels,
-                model_optimized_prompts: isAllModels && (document.getElementById('gen-model-optimized')?.checked || false),
+                decomposed_data: decomposedData || undefined,
+                recomposed_prompt: recomposedPrompt || undefined,
+                all_models: isMultiModel,
+                selected_models: isMultiModel ? this._selectedModels : undefined,
+                model_optimized_prompts: isMultiModel && (document.getElementById('gen-model-optimized')?.checked || false),
                 style_id: this._getStyleId() || null,
                 asset_type: this._getAssetType(),
-                image_model: isAllModels ? 'nova_canvas' : document.getElementById('gen-model').value,
+                image_model: this._selectedModels[0] || 'nova_canvas',
                 quality: document.getElementById('gen-quality')?.value || null,
                 region: document.getElementById('gen-region')?.value || null,
                 width: size.w,
@@ -819,8 +934,8 @@
                 btn.innerHTML = `<span class="spinner-sm"></span> ${t('image_studio.checking')}`;
             }
 
-            // ── Asset Type Classification (LLM-powered) ─────
-            if (window.showConfirm) {
+            // ── Asset Type Classification (LLM-powered) — only if not already confirmed ─────
+            if (window.showConfirm && this._promptEditor && !this._promptEditor._assetTypeConfirmed) {
                 try {
                     const classifyResp = await fetch('/api/refine-prompt/classify-asset-type', {
                         method: 'POST',
@@ -848,6 +963,7 @@
                             }
                         }
                     }
+                    this._promptEditor._assetTypeConfirmed = true;
                 } catch {}
             }
 
@@ -1202,9 +1318,9 @@
                         if (modIpOwn) { const cb = document.getElementById('gen-ip-own'); if (cb) cb.checked = true; }
                         if (modIpLic) { const cb = document.getElementById('gen-ip-license'); if (cb) cb.checked = true; }
 
-                        // Switch model in the dropdown and generate
-                        const modelSel = document.getElementById('gen-model');
-                        if (modelSel) modelSel.value = workingModel;
+                        // Switch model selection and generate
+                        this._selectedModels = [workingModel];
+                        this._syncModelCheckboxes();
                         if (this._promptEditor) this._promptEditor.setText(originalPrompt);
                         this._promptEditor._moderationOriginal = null;
                         dialog.remove();
@@ -1259,8 +1375,8 @@
                                             this._promptEditor._moderationOriginal = originalPrompt;
                                             this._promptEditor.setComposedText(edited);
                                         }
-                                        const modelSel = document.getElementById('gen-model');
-                                        if (modelSel) modelSel.value = analysis.original_model;
+                                        this._selectedModels = [analysis.original_model];
+                                        this._syncModelCheckboxes();
                                         document.getElementById('gen-rewrite-disclaimer')?.classList.remove('hidden');
                                         this._skipPreCheck = true; // Skip pre-check — rewrite IS the moderation fix
                                         dialog.remove();
@@ -1514,8 +1630,7 @@
 
             // Switch model and generate
             document.getElementById('precheck-switch')?.addEventListener('click', () => {
-                const modelSel = document.getElementById('gen-model');
-                if (modelSel && suggested) modelSel.value = suggested;
+                if (suggested) { this._selectedModels = [suggested]; this._syncModelCheckboxes(); }
                 dialog.remove();
                 // Skip pre-check for this generation — user already reviewed and chose the model
                 this._skipPreCheck = true;
@@ -1794,38 +1909,19 @@
             document.getElementById('btn-apply-postprocess')?.classList.remove('hidden');
             document.getElementById('pp-hint')?.classList.remove('hidden');
 
-            // Show original vs used prompt
+            // Show prompt sent to model + negative prompt
+            // Original prompt is already in Step 1 — no need to repeat here.
+            // The per-option prompt updates when user selects an option (in _selectOption).
             const infoSection = document.getElementById('gen-prompt-info');
             const origSection = document.getElementById('gen-original-prompt-section');
-            const origText = document.getElementById('gen-original-prompt-text');
             const usedText = document.getElementById('gen-used-prompt-text');
             if (infoSection) {
                 infoSection.classList.remove('hidden');
-                if (result.original_prompt && result.original_prompt !== result.prompt) {
-                    origSection?.classList.remove('hidden');
-                    if (origText) origText.textContent = result.original_prompt;
-                    if (usedText) usedText.textContent = result.prompt;
-                } else {
-                    // No AI improvement was used — just show the prompt
-                    origSection?.classList.add('hidden');
-                    if (usedText) usedText.textContent = result.prompt;
-                    const usedLabel = document.querySelector('#gen-used-prompt-section > p:first-child');
-                    if (usedLabel) usedLabel.textContent = t('image_studio.prompt_label');
-                }
+                origSection?.classList.add('hidden');  // Step 1 already shows original
+                // Prompt + negative are updated per-option in _selectOption
             }
-
-            // Show negative prompt if present (check all sources)
             const negSection = document.getElementById('gen-negative-prompt-section');
-            const negText = document.getElementById('gen-negative-prompt-text');
-            const negPrompt = result.negative_prompt
-                || this._lastNegativePrompt
-                || (this._promptEditor?.getNegativePrompt?.() || '');
-            if (negSection && negText && negPrompt) {
-                negSection.classList.remove('hidden');
-                negText.textContent = negPrompt;
-            } else if (negSection) {
-                negSection.classList.add('hidden');
-            }
+            if (negSection) negSection.classList.remove('hidden');
 
             // Show options row
             this._renderOptionsRow(options);
@@ -1893,7 +1989,7 @@
                         <div class="grid gap-2 grid-cols-${cols}">`;
 
                     entries.forEach((e, conceptIdx) => {
-                        html += this._renderOptionCard(e.opt, e.globalIdx, `Concept ${conceptIdx + 1}`);
+                        html += this._renderOptionCard(e.opt, e.globalIdx, `o${e.globalIdx + 1} · Concept ${conceptIdx + 1}`);
                     });
 
                     html += '</div></div>';
@@ -1905,7 +2001,8 @@
                 const cols = options.length <= 5 ? options.length : 5;
                 grid.className = `grid gap-3 grid-cols-${cols}`;
                 grid.innerHTML = options.map((opt, i) => {
-                    const cardLabel = opt.model_label || `${t('image_studio.option')} ${i + 1}`;
+                    const modelPart = opt.model_label || `${t('image_studio.option')} ${i + 1}`;
+                    const cardLabel = `o${i + 1} · ${modelPart}`;
                     return this._renderOptionCard(opt, i, cardLabel);
                 }).join('');
             }
@@ -1942,7 +2039,7 @@
                     <div class="absolute top-1.5 left-1.5 bg-black/70 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">
                         ${this._escapeHtml(label)}
                     </div>
-                    ${opt.status && opt.status !== 'success' ? `
+                    ${opt.status === 'moderation_blocked' || opt.status === 'error' || opt.status === 'failed' ? `
                     <div class="absolute inset-0 bg-black/60 flex items-center justify-center">
                         <span class="px-2 py-1 rounded text-xs font-semibold ${opt.status === 'moderation_blocked' ? 'bg-amber-500/80 text-amber-950' : 'bg-red-500/80 text-white'}">
                             ${opt.status === 'moderation_blocked' ? t('image_studio.blocked_moderation') : t('image_studio.failed')}
@@ -1980,36 +2077,29 @@
             }
 
             // Show per-option prompt with label
+            // Per-option prompt is shown in the main gen-prompt-info panel (updated above).
+            // Hide the legacy concept-prompt section to avoid duplication.
             const conceptSection = document.getElementById('gen-concept-prompt');
-            const conceptLabel = document.getElementById('gen-concept-prompt-label');
-            const conceptText = document.getElementById('gen-concept-prompt-text');
-            const conceptNeg = document.getElementById('gen-concept-negative');
-            const conceptNegText = document.getElementById('gen-concept-negative-text');
+            if (conceptSection) conceptSection.classList.add('hidden');
 
-            if (conceptSection && conceptText && option.enhanced_prompt) {
-                conceptSection.classList.remove('hidden');
-                // Label: "Generated prompt — Option N" or "Generated prompt — Nova Canvas"
-                const label = option.model_label
-                    ? `${t('image_studio.generated_prompt')} \u2014 ${option.model_label}`
-                    : `${t('image_studio.generated_prompt')} \u2014 ${t('image_studio.option')} ${index + 1}`;
-                if (conceptLabel) conceptLabel.textContent = label;
-                conceptText.textContent = option.enhanced_prompt;
-
-                // Per-option negative prompt
-                const optNeg = option.negative_prompt || '';
-                if (conceptNeg && conceptNegText) {
-                    if (optNeg) {
-                        conceptNeg.classList.remove('hidden');
-                        conceptNegText.textContent = optNeg;
-                    } else {
-                        conceptNeg.classList.add('hidden');
-                    }
-                }
-
-                // Show status detail for blocked/failed options
-                if (option.status && option.status !== 'success') {
-                    conceptText.textContent = `[${option.status === 'moderation_blocked' ? t('image_studio.blocked_by_moderation') : t('image_studio.generation_failed_status')}] ${option.status_detail || ''}`;
-                }
+            // Update the main prompt info panel to match selected option
+            const usedText = document.getElementById('gen-used-prompt-text');
+            const usedLabel = document.querySelector('#gen-used-prompt-section > p:first-child');
+            if (usedText) {
+                usedText.textContent = option.enhanced_prompt || result.enhanced_prompt || result.refined_prompt || result.prompt || '';
+            }
+            if (usedLabel) {
+                const modelPart = option.model_label || `${t('image_studio.option')} ${index + 1}`;
+                usedLabel.textContent = `${t('image_studio.prompt_sent_to_model')} \u2014 o${index + 1} · ${modelPart}`;
+            }
+            const negText = document.getElementById('gen-negative-prompt-text');
+            const negLabel = document.querySelector('#gen-negative-prompt-section > p:first-child');
+            if (negText) {
+                negText.textContent = option.negative_prompt || t('image_studio.negative_prompt_none');
+            }
+            if (negLabel) {
+                const modelPart = option.model_label || `${t('image_studio.option')} ${index + 1}`;
+                negLabel.textContent = `${t('image_studio.negative_prompt_exclusions')} \u2014 o${index + 1} · ${modelPart}`;
             }
 
             // Render variations for this option
@@ -2154,6 +2244,9 @@
             // the DOM is fully built before we write batch data into it.
             window.location.hash = '#image-studio';
 
+            // Clear old result BEFORE navigating — prevents onShow from re-rendering stale data
+            this._result = null;
+
             // Yield to let the hashchange event fire and navigate() start
             await new Promise(r => setTimeout(r, 0));
 
@@ -2177,13 +2270,46 @@
                 // Ensure prompt editor exists, then populate
                 this._ensurePromptEditor();
                 if (this._promptEditor) {
-                    const displayPrompt = result.prompt || '';
-                    this._promptEditor.setText(displayPrompt);
-                    // Store original so getOriginalText() returns the right thing
-                    if (result.original_prompt) {
-                        this._promptEditor._originalText = result.original_prompt;
+                    // Step 1: original user prompt
+                    const originalPrompt = result.original_prompt || result.prompt || '';
+                    this._promptEditor.setText(originalPrompt);
+                    this._promptEditor._originalText = originalPrompt;
+
+                    // Step 3: AI-enhanced prompt
+                    const enhancedPrompt = result.enhanced_prompt || '';
+                    if (enhancedPrompt) {
+                        this._promptEditor.setComposedText(enhancedPrompt);
+                        this._promptEditor._negativePrompt = result.negative_prompt || '';
                     }
+
+                    // Restore decomposed data from metadata, or clear stale state
+                    if (result.decomposed_data) {
+                        this._promptEditor._decomposedData = result.decomposed_data;
+                    } else {
+                        this._promptEditor._decomposedData = null;
+                    }
+                    if (result.recomposed_prompt) {
+                        this._promptEditor.setDecomposedText(result.recomposed_prompt);
+                    } else {
+                        this._promptEditor.setDecomposedText('');
+                        const panel = this._promptEditor.container?.querySelector('.decomposed-panel');
+                        if (panel) panel.classList.add('hidden');
+                    }
+
+                    // Asset type was already set for this generation — skip re-classification
+                    this._promptEditor._assetTypeConfirmed = true;
+                    // Mark as gallery reload — Designer shows saved data or "no data" message
+                    this._promptEditor._galleryReload = !result.decomposed_data;
                 }
+
+                // Restore model selection from batch metadata
+                if (result.all_models && result.model_map) {
+                    const usedModels = [...new Set(Object.values(result.model_map))];
+                    this._selectedModels = usedModels.length ? usedModels : [result.image_model || MODELS[0]?.value].filter(Boolean);
+                } else if (result.image_model) {
+                    this._selectedModels = [result.image_model];
+                }
+                this._syncModelCheckboxes();
 
                 // Set sidebar controls to match the batch settings
                 const styleSel = document.getElementById('gen-style');
@@ -2192,8 +2318,7 @@
                 const typeSel = document.getElementById('gen-asset-type');
                 if (typeSel && result.asset_type) typeSel.value = result.asset_type;
 
-                const modelSel = document.getElementById('gen-model');
-                if (modelSel && result.image_model) modelSel.value = result.image_model;
+                // Model selector is restored above (handles all_models + deleted endpoints)
 
                 // Restore dimension preset
                 const sizeSel = document.getElementById('gen-size');
@@ -2296,7 +2421,7 @@
             return null;
         },
         _isAllModels() {
-            return document.getElementById('gen-model')?.value === 'all_models';
+            return this._selectedModels.length > 1;
         },
 
         _updateAllModelsUI(isAllModels) {
@@ -2310,7 +2435,7 @@
                 // Keep selectors enabled — user controls options × variations per model
                 if (optsSelect) optsSelect.disabled = false;
                 if (varsSelect) varsSelect.disabled = false;
-                this._updateAllModelsEstimate();
+                this._updateMultiModelCostEstimate();
             } else {
                 allModelsOpts?.classList.add('hidden');
                 if (optsSelect) optsSelect.disabled = false;
@@ -2318,32 +2443,162 @@
             }
         },
 
-        _updateAllModelsEstimate() {
+        _syncModelCheckboxes() {
+            const checkboxes = document.querySelectorAll('.gen-model-cb');
+            const allCheck = document.getElementById('gen-model-all');
+            const realModels = MODELS.filter(m => m.value !== 'all_models');
+
+            checkboxes.forEach(cb => {
+                cb.checked = this._selectedModels.includes(cb.value);
+            });
+            if (allCheck) {
+                allCheck.checked = this._selectedModels.length === realModels.length;
+            }
+
+            // Update button label
+            const label = document.getElementById('gen-model-label');
+            if (label) {
+                if (this._selectedModels.length === 0) {
+                    label.textContent = t('image_studio.select_models') || 'Select models...';
+                } else if (this._selectedModels.length === 1) {
+                    const m = MODELS.find(m => m.value === this._selectedModels[0]);
+                    label.textContent = m?.label || this._selectedModels[0];
+                } else if (this._selectedModels.length === realModels.length) {
+                    label.textContent = `${t('image_studio.all_models') || 'All'} (${realModels.length} ${t('image_studio.models_count') || 'models'})`;
+                } else {
+                    label.textContent = `${this._selectedModels.length} ${t('image_studio.models_selected') || 'models selected'}`;
+                }
+            }
+
+            // Show/hide multi-model options
+            const isMulti = this._selectedModels.length > 1;
+            this._updateAllModelsUI(isMulti);
+
+            // Update quality/region for single model, or clear for multi
+            if (this._selectedModels.length === 1) {
+                this._updateQualityForModel(this._selectedModels[0]);
+                this._updateRegionForModel(this._selectedModels[0]);
+            } else {
+                this._updateQualityForModel('all_models');
+                this._updateRegionForModel('all_models');
+            }
+
+            // Update size dropdown based on selected models' supported_sizes
+            this._updateSizePresetsForModels();
+
+            this._updateMultiModelCostEstimate();
+        },
+
+        _updateSizePresetsForModels() {
+            const sizeSel = document.getElementById('gen-size');
+            if (!sizeSel) return;
+
+            const currentValue = sizeSel.value;
+            const currentSize = SIZE_PRESETS[parseInt(currentValue, 10)] || null;
+
+            // Collect supported_sizes from selected models
+            const selectedData = this._selectedModels
+                .map(key => MODELS.find(m => m.value === key))
+                .filter(Boolean);
+
+            // If any selected model declares supported_sizes, use union of all
+            const modelSizes = selectedData
+                .filter(m => m.supported_sizes?.length)
+                .flatMap(m => m.supported_sizes);
+
+            let sizes;
+            if (modelSizes.length > 0) {
+                // Deduplicate by "WxH" key, preserve order
+                const seen = new Set();
+                sizes = [];
+                for (const s of modelSizes) {
+                    const key = `${s.w}x${s.h}`;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        sizes.push(s);
+                    }
+                }
+                // Sort: square first, then landscape, then portrait, by area ascending
+                sizes.sort((a, b) => {
+                    const areaA = a.w * a.h, areaB = b.w * b.h;
+                    if (areaA !== areaB) return areaA - areaB;
+                    return b.w - a.w;
+                });
+            } else {
+                // No model declares sizes — use defaults
+                sizes = SIZE_PRESETS;
+            }
+
+            // Rebuild the dropdown
+            sizeSel.innerHTML = '';
+            sizes.forEach((s, i) => {
+                const opt = document.createElement('option');
+                opt.value = i;
+                opt.textContent = s.label;
+                sizeSel.appendChild(opt);
+            });
+
+            // Store current sizes for payload construction
+            this._activeSizePresets = sizes;
+
+            // Try to restore previous selection by matching dimensions
+            if (currentSize) {
+                const match = sizes.findIndex(s => s.w === currentSize.w && s.h === currentSize.h);
+                if (match >= 0) {
+                    sizeSel.value = match;
+                    return;
+                }
+            }
+            // Default to 1024x1024 or index 2
+            const default1024 = sizes.findIndex(s => s.w === 1024 && s.h === 1024);
+            sizeSel.value = default1024 >= 0 ? default1024 : Math.min(2, sizes.length - 1);
+        },
+
+        _updateMultiModelCostEstimate() {
+            const costEl = document.getElementById('gen-cost-estimate');
+            const summaryEl = document.getElementById('gen-model-summary');
             const infoEl = document.getElementById('gen-all-models-info');
-            if (!infoEl) return;
-            const modelCount = MODELS.filter(m => m.value !== 'all_models').length;
+
+            if (this._selectedModels.length === 1) {
+                // Delegate to existing single-model summary
+                if (infoEl) infoEl.textContent = '';
+                this._updateModelSummary();
+                return;
+            }
+
+            // Multi-model cost estimate
+            if (summaryEl) summaryEl.textContent = '';
+
             const nOpts = parseInt(document.getElementById('gen-num-options')?.value || '1', 10);
             const nVars = parseInt(document.getElementById('gen-num-variations')?.value || '1', 10);
+            const modelCount = this._selectedModels.length;
             const totalImages = modelCount * nOpts * nVars;
 
-            let msg = `${modelCount} models × ${nOpts} option${nOpts > 1 ? 's' : ''} × ${nVars} variation${nVars > 1 ? 's' : ''} = ${totalImages} images`;
+            const totalCost = this._selectedModels.reduce((sum, key) => {
+                const m = MODELS.find(m => m.value === key);
+                return sum + (m?.base_price_usd || 0.08) * nOpts * nVars;
+            }, 0);
 
-            // Cost estimate from model prices
-            const totalCost = MODELS
-                .filter(m => m.value !== 'all_models')
-                .reduce((sum, m) => sum + (m.base_price_usd || 0.08) * nOpts * nVars, 0);
+            let msg = `${modelCount} models \u00d7 ${nOpts} option${nOpts > 1 ? 's' : ''} \u00d7 ${nVars} variation${nVars > 1 ? 's' : ''} = ${totalImages} images`;
             if (totalCost > 0) msg += ` (~$${totalCost.toFixed(2)})`;
 
-            // Warnings
-            if (totalImages > 100) {
-                infoEl.className = 'text-[10px] text-red-400';
-                msg += ' — large batch, will take several minutes';
-            } else if (totalImages > 50) {
-                infoEl.className = 'text-[10px] text-amber-400';
-            } else {
-                infoEl.className = 'text-[10px] text-emerald-400/70';
+            if (infoEl) {
+                if (totalImages > 100) {
+                    infoEl.className = 'text-[10px] text-red-400';
+                    msg += ' \u2014 large batch, will take several minutes';
+                } else if (totalImages > 50) {
+                    infoEl.className = 'text-[10px] text-amber-400';
+                } else {
+                    infoEl.className = 'text-[10px] text-emerald-400/70';
+                }
+                infoEl.textContent = msg;
             }
-            infoEl.textContent = msg;
+
+            if (costEl) {
+                costEl.textContent = totalCost > 0
+                    ? `Est. ~$${totalCost.toFixed(2)} (${totalImages} images \u00d7 ${modelCount} models)`
+                    : '';
+            }
         },
 
         _getIpDeclaration() {
@@ -2357,11 +2612,12 @@
             const note = document.getElementById('gen-ip-model-note');
             if (!note) return;
             const ip = this._getIpDeclaration();
-            const model = document.getElementById('gen-model')?.value || '';
+            const model = (this._selectedModels?.[0] || '') || '';
             const strictModels = ['nova_canvas', 'titan_image'];
 
             if ((ip.ip_owned || ip.ip_licensed) && strictModels.includes(model)) {
-                const modelLabel = document.getElementById('gen-model')?.selectedOptions?.[0]?.text || model;
+                const modelData = MODELS.find(m => m.value === model);
+                const modelLabel = modelData?.label || model;
                 note.innerHTML = `
                     ${t('image_studio.ip_strict_model_warning').replace('{{model}}', '<strong>' + modelLabel + '</strong>')}
                     <button id="gen-ip-switch-model" class="underline text-amber-200 hover:text-amber-100 ml-1">${t('image_studio.ip_switch_now')}</button>
@@ -2371,8 +2627,8 @@
                 // Wire up the quick-switch button
                 setTimeout(() => {
                     document.getElementById('gen-ip-switch-model')?.addEventListener('click', () => {
-                        const sel = document.getElementById('gen-model');
-                        if (sel) sel.value = 'sd35_large';
+                        this._selectedModels = ['sd35_large'];
+                        this._syncModelCheckboxes();
                         this._updateIpModelNote();
                         window.showToast?.(t('image_studio.switched_to'), 'success');
                     });
@@ -2426,17 +2682,21 @@
         _notifiedJobIds: new Set(), // Track which completions we've toasted
 
         _pollPendingJobs() {
-            // Do one initial check, then only poll if there are active jobs
+            // One-time check at startup for recovery after server restart.
+            // If active jobs found → starts polling. If not → stops. No loop.
             this._checkAsyncJobs();
         },
 
         _startAsyncPolling() {
             if (this._pendingJobsActive) return;
             this._pendingJobsActive = true;
+            this._pollingStartedAt = Date.now();
             this._asyncPollLoop();
         },
 
         _stopAsyncPolling() {
+            // Don't stop within 30s of starting — jobs may not be registered yet
+            if (this._pollingStartedAt && Date.now() - this._pollingStartedAt < 30000) return;
             this._pendingJobsActive = false;
             clearTimeout(this._pendingJobsTimer);
         },

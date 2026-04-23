@@ -407,11 +407,16 @@ def deploy_endpoint(model_key: str, endpoint_type: str = "async",
     else:
         instance = instance_type or model["requirements"]["recommended_instance"]
         # Unique endpoint name: model + instance type + short ID.
-        # Allows multiple deployments of the same model on different (or same) hardware.
+        # Allows multiple deployments of the same model on different hardware.
+        # SageMaker model name = endpoint_name + "-model", max 63 chars.
+        # Endpoint name: artsmoker-{model_key}-{short_id} (no instance type — user never sees it)
         import hashlib, time as _t
-        inst_suffix = instance.replace("ml.", "").replace(".", "-")
         short_id = hashlib.md5(f"{model_key}{instance}{_t.time()}".encode()).hexdigest()[:4]
-        endpoint_name = f"artsmoker-{model_key.replace('_', '-')}-{inst_suffix}-{short_id}"
+        base = f"artsmoker-{model_key.replace('_', '-')}"
+        max_base = 57 - len(short_id) - 1  # 1 for the hyphen before short_id
+        if len(base) > max_base:
+            base = base[:max_base]
+        endpoint_name = f"{base}-{short_id}"
 
     if progress_callback:
         progress_callback(f"Creating Amazon SageMaker {endpoint_type} endpoint: {endpoint_name}...")
@@ -797,15 +802,13 @@ def _scan_logs_for_readiness(endpoint_name: str) -> dict:
             if last_activity_ts is None:
                 last_activity_ts = event_ts
 
-            # Success: model loaded — match both our handler's log and MMS internal log
+            # Success: model loaded — ONLY match our handler's log, not MMS internal log.
             # Handler: "Model flux2_dev loaded in 189.4s (library=diffusers)"
-            # MMS:     "Model model loaded io_fd=..."
-            if ("loaded in" in msg and "Model" in msg) or ("Model model loaded" in msg):
+            # MMS emits "Model model loaded io_fd=..." even when the handler CRASHES
+            # (it just means the worker connected, not that model_fn succeeded).
+            if "loaded in" in msg and "Model" in msg and "library=" in msg:
                 try:
-                    if "loaded in" in msg:
-                        detail = msg[msg.index("Model"):msg.index("Model") + 80]
-                    else:
-                        detail = "Model loaded"
+                    detail = msg[msg.index("Model"):msg.index("Model") + 80]
                 except (ValueError, IndexError):
                     detail = "Model loaded"
                 return {"ready": True, "detail": detail, "last_activity_ms": event_ts}
@@ -1307,18 +1310,36 @@ def _register_auto_scaling_after_ready(endpoint_name: str):
     Called from the readiness monitor or quick log scan. This ensures
     the scale-to-zero policy is only applied once the model is loaded,
     preventing scale-in from killing instances during long model loads.
+
+    Idempotent: checks AWS for existing policies before registering.
     """
     if endpoint_name in _auto_scaling_registered:
-        return  # Already registered
+        return  # Already registered this session
 
     if endpoint_name in _build_only_endpoints:
         logger.info("Skipping auto-scaling for %s — build-only deploy (cache save in progress)", endpoint_name)
         return
 
+    # Check if auto-scaling already exists in AWS (survives server restarts)
+    try:
+        import boto3
+        aas = boto3.client("application-autoscaling", region_name=_get_region())
+        resource_id = f"endpoint/{endpoint_name}/variant/primary"
+        resp = aas.describe_scaling_policies(
+            ServiceNamespace="sagemaker",
+            ResourceId=resource_id,
+            ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+        )
+        if resp.get("ScalingPolicies"):
+            _auto_scaling_registered.add(endpoint_name)
+            logger.debug("Auto-scaling already configured for %s — skipping", endpoint_name)
+            return
+    except Exception:
+        pass  # If check fails, proceed with registration attempt
+
     # Compute cooldown from model config
     from .custom_models import get_catalog
     catalog = get_catalog()
-    # Find the model key from endpoint name (artsmoker-flux2-dev → flux2_dev)
     model_key = endpoint_name.replace("artsmoker-", "").replace("-", "_")
     model = catalog.get("models", {}).get(model_key, {})
     invoke = model.get("invoke", {})
@@ -1328,6 +1349,7 @@ def _register_auto_scaling_after_ready(endpoint_name: str):
     try:
         _setup_auto_scaling(endpoint_name, scale_in_cooldown=cooldown)
         _auto_scaling_registered.add(endpoint_name)
+        logger.info("Auto-scaling configured for %s (scale to zero + scale from zero)", endpoint_name)
         logger.info("Auto-scaling registered for %s (cooldown=%ds) — model confirmed ready", endpoint_name, cooldown)
     except Exception as e:
         logger.warning("Auto-scaling setup failed for %s after model ready: %s — retrying in background", endpoint_name, e)
@@ -1414,7 +1436,7 @@ def _setup_auto_scaling(endpoint_name: str, scale_in_cooldown: int = 600):
         StepScalingPolicyConfiguration={
             "AdjustmentType": "ChangeInCapacity",
             "StepAdjustments": [{"MetricIntervalLowerBound": 0, "ScalingAdjustment": 1}],
-            "Cooldown": 300,
+            "Cooldown": 60,
         },
     )
 
@@ -1654,7 +1676,7 @@ def _get_model_environment(model_key: str, model: dict,
         "INVOKE_CONFIG": json.dumps(
             {k: v for k, v in invoke.items() if k not in (
                 "prompt_guidance", "input_fields", "supports_negative_prompt",
-                "max_prompt_length", "typical_latency_seconds",
+                "max_prompt_length", "typical_latency_seconds", "supported_sizes",
             )},
             default=str,
         ),
@@ -1704,6 +1726,37 @@ def _get_model_environment(model_key: str, model: dict,
         env["ARTSMOKER_CACHE_BUCKET"] = bucket
         env["ARTSMOKER_CACHE_PREFIX"] = f"{S3_MODEL_PREFIX}/{model_key}/model-cache"
         env["ARTSMOKER_CACHE_VERSION"] = model.get("version", "1.0")
+
+    # NCCL fix for pip-upgraded torch: the DLC Dockerfile has
+    # ENV LD_PRELOAD="/usr/local/lib/libnccl.so" baked in, which forces the
+    # old NCCL (v2.23) to load before any process starts. When pip upgrades
+    # torch to 2.8, it installs NCCL 2.27+ but the LD_PRELOAD loads the old one.
+    # Fix: override LD_PRELOAD via SageMaker container env var (equivalent to
+    # docker run -e, overrides Dockerfile ENV defaults) to point to pip-installed NCCL.
+    base_reqs = model.get("python_requirements", {}).get("base", [])
+    needs_torch_upgrade = any("torch==2.8" in r or "torch>=2.8" in r for r in base_reqs)
+    if needs_torch_upgrade:
+        # Override ALL NVIDIA library paths: NCCL, cuDNN, and other CUDA libs.
+        # The DLC container's system libraries (CUDA 12.4) are too old for torch 2.8.
+        # Pip-installed versions (via torch's dependencies) are at the correct version
+        # but the system ones load first. Prepend ALL pip-installed NVIDIA lib paths.
+        nvidia_base = "/opt/conda/lib/python3.12/site-packages/nvidia"
+        nvidia_libs = [
+            f"{nvidia_base}/nccl/lib",
+            f"{nvidia_base}/cudnn/lib",
+            f"{nvidia_base}/cublas/lib",
+            f"{nvidia_base}/cufft/lib",
+            f"{nvidia_base}/curand/lib",
+            f"{nvidia_base}/cusolver/lib",
+            f"{nvidia_base}/cusparse/lib",
+            f"{nvidia_base}/cuda_runtime/lib",
+            f"{nvidia_base}/cuda_nvrtc/lib",
+            f"{nvidia_base}/cuda_cupti/lib",
+        ]
+        nvidia_ld = ":".join(nvidia_libs)
+        env["LD_PRELOAD"] = f"{nvidia_base}/nccl/lib/libnccl.so.2"
+        default_ld = "/opt/conda/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+        env["LD_LIBRARY_PATH"] = f"{nvidia_ld}:{default_ld}"
 
     return env
 

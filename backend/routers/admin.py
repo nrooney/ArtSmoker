@@ -169,7 +169,12 @@ async def update_postprocess_model(key: str, body: PostProcessUpdate):
 async def reload_registry():
     """Reload the model registry from disk."""
     reload()
-    return {"status": "reloaded"}
+    from backend.services.model_registry import get_registry
+    reg = get_registry()
+    image_count = len(reg.get("image_models", {}))
+    chat_count = len(reg.get("chat_models", {}))
+    logger.info("Model registry reloaded: %d image models, %d chat models", image_count, chat_count)
+    return {"status": "reloaded", "image_models": image_count, "chat_models": chat_count}
 
 
 # ── Prompt Templates ──────────────────────────────────────────────────────
@@ -443,6 +448,7 @@ def get_image_model_options(region: str | None = Query(default=None)):
             "default_quality": cfg.get("default_quality"),
             "base_price_usd": cfg.get("base_price_usd"),
             "model_source": cfg.get("model_source", "foundation"),
+            "supported_sizes": cfg.get("invoke", {}).get("supported_sizes"),
             "_last_updated": cfg.get("last_updated", cfg.get("invoke", {}).get("last_updated", "")),
         })
 
