@@ -174,6 +174,10 @@
         type = type || 'info';
         duration = duration || 4000;
 
+        // Mirror errors/warnings to browser console so they're visible even if the toast disappears
+        if (type === 'error') console.error('[Toast]', message);
+        else if (type === 'warning') console.warn('[Toast]', message);
+
         const container = document.getElementById('toast-container');
         if (!container) return;
 
