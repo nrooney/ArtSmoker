@@ -192,21 +192,27 @@ async def get_instance_options(model_key: str):
     needs_bf16 = model_dtype == "bfloat16"
     recommended = model.get("requirements", {}).get("recommended_instance", "")
 
-    # Query account quotas
+    # Query account quotas — applied quotas take precedence over defaults
     import boto3
     try:
-        sq = boto3.client("service-quotas", region_name="us-west-2")
+        from backend.services.sagemaker_deployer import _get_region
+        sq = boto3.client("service-quotas", region_name=_get_region())
         quotas = {}
-        paginator = sq.get_paginator("list_service_quotas")
-        for page in paginator.paginate(ServiceCode="sagemaker"):
-            for q in page.get("Quotas", []):
-                name = q.get("QuotaName", "")
-                if "endpoint" in name.lower() and "usage" in name.lower():
-                    value = int(q.get("Value", 0))
-                    if value > 0:
-                        # Extract instance type from quota name (e.g., "ml.g5.xlarge for endpoint usage")
+
+        def _extract(pages):
+            for page in pages:
+                for q in page.get("Quotas", []):
+                    name = q.get("QuotaName", "")
+                    if "endpoint" in name.lower() and "usage" in name.lower():
+                        value = int(q.get("Value", 0))
                         instance = name.replace(" for endpoint usage", "").strip()
-                        quotas[instance] = value
+                        if instance not in quotas and value > 0:
+                            quotas[instance] = value
+
+        # Start with AWS defaults so all instances with quota > 0 are visible
+        _extract(sq.get_paginator("list_aws_default_service_quotas").paginate(ServiceCode="sagemaker"))
+        # Applied (account-level) quotas override defaults
+        _extract(sq.get_paginator("list_service_quotas").paginate(ServiceCode="sagemaker"))
     except Exception as e:
         logger.warning("Failed to query service quotas: %s", e)
         quotas = {}
