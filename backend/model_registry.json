@@ -5545,7 +5545,8 @@
         "vcpus": 4,
         "cost_per_hour_usd": 0.74,
         "compute_capability": 7.5,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-B67CFA0C"
       },
       "ml.g4dn.2xlarge": {
         "gpus": 1,
@@ -5556,7 +5557,8 @@
         "vcpus": 8,
         "cost_per_hour_usd": 1.12,
         "compute_capability": 7.5,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-EA346344"
       },
       "ml.g4dn.4xlarge": {
         "gpus": 1,
@@ -5567,7 +5569,8 @@
         "vcpus": 16,
         "cost_per_hour_usd": 1.79,
         "compute_capability": 7.5,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-31522FA6"
       },
       "ml.g4dn.8xlarge": {
         "gpus": 1,
@@ -5578,7 +5581,8 @@
         "vcpus": 32,
         "cost_per_hour_usd": 3.23,
         "compute_capability": 7.5,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-7D28AD75"
       },
       "ml.g4dn.12xlarge": {
         "gpus": 4,
@@ -5589,7 +5593,8 @@
         "vcpus": 48,
         "cost_per_hour_usd": 5.87,
         "compute_capability": 7.5,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-07BEB181"
       },
       "ml.g5.xlarge": {
         "gpus": 1,
@@ -5600,7 +5605,8 @@
         "vcpus": 4,
         "cost_per_hour_usd": 1.41,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-1928E07B"
       },
       "ml.g5.2xlarge": {
         "gpus": 1,
@@ -5611,7 +5617,8 @@
         "vcpus": 8,
         "cost_per_hour_usd": 2.82,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-9614C779"
       },
       "ml.g5.4xlarge": {
         "gpus": 1,
@@ -5622,7 +5629,8 @@
         "vcpus": 16,
         "cost_per_hour_usd": 4.44,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-C1B9A48D"
       },
       "ml.g5.8xlarge": {
         "gpus": 1,
@@ -5633,7 +5641,8 @@
         "vcpus": 32,
         "cost_per_hour_usd": 5.63,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-065D610E"
       },
       "ml.g5.12xlarge": {
         "gpus": 4,
@@ -5644,7 +5653,8 @@
         "vcpus": 48,
         "cost_per_hour_usd": 7.09,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-65C4BD00"
       },
       "ml.g5.16xlarge": {
         "gpus": 1,
@@ -5655,7 +5665,8 @@
         "vcpus": 64,
         "cost_per_hour_usd": 7.09,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-962705EA"
       },
       "ml.g5.24xlarge": {
         "gpus": 4,
@@ -5666,7 +5677,8 @@
         "vcpus": 96,
         "cost_per_hour_usd": 10.63,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-6821867B"
       },
       "ml.g5.48xlarge": {
         "gpus": 8,
@@ -5677,7 +5689,8 @@
         "vcpus": 192,
         "cost_per_hour_usd": 21.26,
         "compute_capability": 8.6,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-0100B823"
       },
       "ml.g6e.xlarge": {
         "gpus": 1,
@@ -5688,7 +5701,8 @@
         "vcpus": 4,
         "cost_per_hour_usd": 2.61,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-B0729CB4"
       },
       "ml.g6e.2xlarge": {
         "gpus": 1,
@@ -5699,7 +5713,8 @@
         "vcpus": 8,
         "cost_per_hour_usd": 5.22,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-F8D7F460"
       },
       "ml.g6e.4xlarge": {
         "gpus": 1,
@@ -5710,7 +5725,8 @@
         "vcpus": 16,
         "cost_per_hour_usd": 10.44,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-93531071"
       },
       "ml.g6e.8xlarge": {
         "gpus": 1,
@@ -5721,7 +5737,8 @@
         "vcpus": 32,
         "cost_per_hour_usd": 20.88,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-96A28D02"
       },
       "ml.g6e.12xlarge": {
         "gpus": 4,
@@ -5732,7 +5749,8 @@
         "vcpus": 48,
         "cost_per_hour_usd": 31.32,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-60313EA3"
       },
       "ml.g6e.16xlarge": {
         "gpus": 4,
@@ -5743,7 +5761,8 @@
         "vcpus": 64,
         "cost_per_hour_usd": 41.76,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-2930A179"
       },
       "ml.g6e.24xlarge": {
         "gpus": 4,
@@ -5754,7 +5773,8 @@
         "vcpus": 96,
         "cost_per_hour_usd": 62.64,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-AE407E8B"
       },
       "ml.g6e.48xlarge": {
         "gpus": 8,
@@ -5765,7 +5785,8 @@
         "vcpus": 192,
         "cost_per_hour_usd": 125.28,
         "compute_capability": 8.9,
-        "bf16": true
+        "bf16": true,
+        "quota_code": "L-E0C458EA"
       },
       "ml.g7e.2xlarge": {
         "gpus": 1,
@@ -5842,7 +5863,8 @@
         "vcpus": 8,
         "cost_per_hour_usd": 4.56,
         "compute_capability": 7.0,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-1623D0BE"
       },
       "ml.p3.8xlarge": {
         "gpus": 4,
@@ -5853,7 +5875,8 @@
         "vcpus": 32,
         "cost_per_hour_usd": 17.14,
         "compute_capability": 7.0,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-CB985DC5"
       },
       "ml.p3.16xlarge": {
         "gpus": 8,
@@ -5864,7 +5887,8 @@
         "vcpus": 64,
         "cost_per_hour_usd": 34.27,
         "compute_capability": 7.0,
-        "bf16": false
+        "bf16": false,
+        "quota_code": "L-6A85BC13"
       }
     }
   }

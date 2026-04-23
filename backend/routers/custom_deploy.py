@@ -193,49 +193,35 @@ async def get_instance_options(model_key: str):
     needs_bf16 = model_dtype == "bfloat16"
     recommended = model.get("requirements", {}).get("recommended_instance", "")
 
-    # Query account quotas — applied quotas take precedence over defaults.
-    # SageMaker has ~2000 quotas, so pagination can hit rate limits.
-    # We use retry with backoff to handle TooManyRequestsException.
+    # Query account quotas — use targeted get_service_quota calls instead of
+    # paginating all ~2000 SageMaker quotas (which causes rate limiting).
+    # Each gpu_instance entry has a quota_code for direct lookup.
     import boto3
-    import time as _time
     try:
         from backend.services.sagemaker_deployer import _get_region
         sq = boto3.client("service-quotas", region_name=_get_region())
         quotas = {}
 
-        def _extract(pages):
-            for page in pages:
-                for q in page.get("Quotas", []):
-                    name = q.get("QuotaName", "")
-                    if "endpoint" in name.lower() and "usage" in name.lower():
-                        value = int(q.get("Value", 0))
-                        instance = re.sub(r"\s+for\s+endpoint\s+usage", "", name, flags=re.IGNORECASE).strip()
-                        if value > 0:
-                            quotas[instance] = value
-
-        def _paginate_with_retry(api_name: str, max_retries: int = 3):
-            """Paginate a Service Quotas API with retry on rate limit."""
-            paginator = sq.get_paginator(api_name)
-            pages = []
+        for instance_type, specs in gpu_catalog.items():
+            if instance_type.startswith("_"):
+                continue
+            quota_code = specs.get("quota_code")
+            if not quota_code:
+                continue
             try:
-                for page in paginator.paginate(ServiceCode="sagemaker"):
-                    pages.append(page)
-            except sq.exceptions.TooManyRequestsException:
-                # Rate limited mid-pagination — retry with backoff
-                for attempt in range(max_retries):
-                    _time.sleep(2 ** attempt)
-                    try:
-                        pages = list(paginator.paginate(ServiceCode="sagemaker"))
-                        break
-                    except sq.exceptions.TooManyRequestsException:
-                        if attempt == max_retries - 1:
-                            raise
-            return pages
-
-        # Start with AWS defaults so all instances with quota > 0 are visible
-        _extract(_paginate_with_retry("list_aws_default_service_quotas"))
-        # Applied (account-level) quotas override defaults
-        _extract(_paginate_with_retry("list_service_quotas"))
+                # Try applied (account-level) quota first
+                resp = sq.get_service_quota(ServiceCode="sagemaker", QuotaCode=quota_code)
+                value = int(resp.get("Quota", {}).get("Value", 0))
+                if value > 0:
+                    quotas[instance_type] = value
+                    continue
+                # If applied is 0, check AWS default
+                resp = sq.get_aws_default_service_quota(ServiceCode="sagemaker", QuotaCode=quota_code)
+                value = int(resp.get("Quota", {}).get("Value", 0))
+                if value > 0:
+                    quotas[instance_type] = value
+            except Exception as e:
+                logger.debug("Quota lookup failed for %s: %s", instance_type, e)
     except Exception as e:
         logger.warning("Failed to query service quotas: %s", e)
         quotas = {}
