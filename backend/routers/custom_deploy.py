@@ -10,6 +10,7 @@ and automatically cleaned up when the model is torn down.
 """
 
 import logging
+import re
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -205,8 +206,8 @@ async def get_instance_options(model_key: str):
                     name = q.get("QuotaName", "")
                     if "endpoint" in name.lower() and "usage" in name.lower():
                         value = int(q.get("Value", 0))
-                        instance = name.replace(" for endpoint usage", "").strip()
-                        if instance not in quotas and value > 0:
+                        instance = re.sub(r"\s+for\s+endpoint\s+usage", "", name, flags=re.IGNORECASE).strip()
+                        if value > 0:
                             quotas[instance] = value
 
         # Start with AWS defaults so all instances with quota > 0 are visible
